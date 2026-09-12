@@ -1,0 +1,81 @@
+CREATE DATABASE IF NOT EXISTS taller_automotriz_db;
+USE taller_automotriz_db;
+
+CREATE TABLE IF NOT EXISTS usuarios (
+    id_usuario INT AUTO_INCREMENT PRIMARY KEY,
+    nombre_completo VARCHAR(100) NOT NULL,
+    usuario VARCHAR(50) NOT NULL UNIQUE,
+    correo VARCHAR(100),
+    telefono VARCHAR(20),
+    password_hash VARCHAR(256) NOT NULL,
+    rol ENUM('Administrador', 'Mecánico', 'Cliente') NOT NULL,
+    estado ENUM('Activo', 'Inactivo') DEFAULT 'Activo',
+    fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS vehiculos (
+    id_vehiculo INT AUTO_INCREMENT PRIMARY KEY,
+    id_cliente INT,
+    placa VARCHAR(10) NOT NULL UNIQUE,
+    marca_modelo VARCHAR(100) NOT NULL,
+    color VARCHAR(30),
+    anio INT,
+    fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (id_cliente) REFERENCES usuarios(id_usuario) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS citas (
+    id_cita INT AUTO_INCREMENT PRIMARY KEY,
+    id_cliente INT,
+    placa VARCHAR(10) NOT NULL,
+    fecha_cita DATE NOT NULL,
+    motivo VARCHAR(255) NOT NULL,
+    estado ENUM('Pendiente', 'Confirmada', 'Atendida', 'Cancelada') DEFAULT 'Pendiente',
+    fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (id_cliente) REFERENCES usuarios(id_usuario) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS catalogo_servicios (
+    id_servicio INT AUTO_INCREMENT PRIMARY KEY,
+    nombre_servicio VARCHAR(100) NOT NULL,
+    descripcion TEXT,
+    costo_base DECIMAL(10,2) NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ordenes_trabajo (
+    id_orden INT AUTO_INCREMENT PRIMARY KEY,
+    id_vehiculo INT NOT NULL,
+    id_mecanico INT,
+    falla_reportada TEXT NOT NULL,
+    diagnostico TEXT,
+    estado ENUM('Ingresado', 'En Reparación', 'Listo para Entrega', 'Entregado') DEFAULT 'Ingresado',
+    total_cobrado DECIMAL(10,2) DEFAULT 0.00,
+    fecha_ingreso TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    fecha_entrega DATETIME NULL,
+    FOREIGN KEY (id_vehiculo) REFERENCES vehiculos(id_vehiculo) ON DELETE CASCADE,
+    FOREIGN KEY (id_mecanico) REFERENCES usuarios(id_usuario) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS detalle_orden_servicios (
+    id_detalle INT AUTO_INCREMENT PRIMARY KEY,
+    id_orden INT NOT NULL,
+    id_servicio INT NOT NULL,
+    precio_aplicado DECIMAL(10,2) NOT NULL,
+    FOREIGN KEY (id_orden) REFERENCES ordenes_trabajo(id_orden) ON DELETE CASCADE,
+    FOREIGN KEY (id_servicio) REFERENCES catalogo_servicios(id_servicio)
+);
+
+CREATE TABLE IF NOT EXISTS logs_sistema (
+    id_log INT AUTO_INCREMENT PRIMARY KEY,
+    usuario VARCHAR(100) NOT NULL,
+    rol VARCHAR(50) NOT NULL,
+    accion VARCHAR(255) NOT NULL,
+    fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO usuarios (nombre_completo, usuario, correo, telefono, password_hash, rol) 
+VALUES ('Karoll Gomez', 'admin', 'admin@taller.com', '3000000000', SHA2('admin123', 256), 'Administrador')
+ON DUPLICATE KEY UPDATE usuario=usuario;
+
+INSERT INTO logs_sistema (usuario, rol, accion) 
+VALUES ('Sistema', 'Administrador', 'Estructura e inicialización de la base de datos completada exitosamente.');
