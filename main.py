@@ -1,14 +1,71 @@
-import customtkinter as ctk
-from tkinter import messagebox, Canvas
-from PIL import Image, ImageDraw
-import mysql.connector
-import hashlib
 import os
-import random
+import re
+import sys
+import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime
+
+import customtkinter as ctk
+import mysql.connector
+from PIL import Image, ImageDraw
+from tkinter import messagebox
+
+# IMPORTS DESDE NUESTROS MÓDULOS PROPIOS
+from database import obtener_conexion
+from seguridad import SeguridadService, CodigoRecuperacion, MAX_INTENTOS_LOGIN, BLOQUEO_MINUTOS
+from sesiones_service import registrar_inicio_sesion, validar_sesion_activa, retomar_sesion
+from vistas.admin_view import VistaAdministrador
+from vistas.mecanico_view import VistaMecanico
+from vistas.cliente_view import VistaCliente
+from vistas.base_view import normalizar_rol
 
 ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("dark-blue")
+
+# ---------------------------------------------------------------------------
+# CONSTANTES
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CARPETAS_RECURSOS = (os.path.join(BASE_DIR, "assets"), BASE_DIR)
+
+TIEMPO_BLOQUEO_SEG = 150        # 2.5 min: bloqueo con clave
+TIEMPO_EXPIRACION_SEG = 300     # 5 min: cierre de sesión forzado
+MAX_INTENTOS_DESBLOQUEO = 3
+
+MOSTRAR_CODIGO_EN_PANTALLA = True
+
+ROJO = "#D32F2F"
+ROJO_H = "#B71C1C"
+CARD_BG = ("#FFFFFF", "#1E1E22")
+CARD_BORDE = ("#E5E7EB", "#2A2D34")
+TXT_T = ("#111827", "#F9FAFB")
+TXT_S = ("#4B5563", "#9CA3AF")
+BTN_GRIS = ("#E5E7EB", "#2A2D34")
+BTN_GRIS_H = ("#D1D5DB", "#374151")
+
+
+def buscar_recurso(*nombres):
+    """Busca el archivo en assets/ y luego en la carpeta del proyecto."""
+    for carpeta in CARPETAS_RECURSOS:
+        for n in nombres:
+            ruta = os.path.join(carpeta, n)
+            if os.path.exists(ruta):
+                return ruta
+    return None
+
+
+@contextmanager
+def conexion_db(dictionary=False):
+    """Abre conexión + cursor y los cierra siempre, aunque ocurra un error."""
+    con = obtener_conexion()
+    cur = con.cursor(dictionary=dictionary)
+    try:
+        yield con, cur
+    finally:
+        cur.close()
+        con.close()
+
 
 class AppTallerAutomotriz(ctk.CTk):
     def __init__(self):
@@ -17,34 +74,39 @@ class AppTallerAutomotriz(ctk.CTk):
         self.title("TALLER AUTOMOTRIZ I.G - Software de Gestión")
         self.after(0, lambda: self.wm_state('zoomed'))
 
-        self.ruta_fondo_claro = "fondo.png"
-        posibles_fondos = [
-            "fondo pantalla.png", "fondo pantalla.jpg", 
-            "fondo_pantalla.png", "fondo_pantalla.jpg",
-            "fondo Oscuro.png", "fondo Oscuro.jpg", 
-            "fondo_oscuro.png", "fondo_oscuro.jpg"
-        ]
-        
-        self.ruta_fondo_oscuro = "fondo.png"
-        for f in posibles_fondos:
-            if os.path.exists(f):
-                self.ruta_fondo_oscuro = f
-                break
+        # RUTAS RELATIVAS (assets/ o carpeta del proyecto)
+        self.ruta_fondo_claro = buscar_recurso("fondo.png", "fondo.jpg")
+        self.ruta_fondo_oscuro = buscar_recurso(
+            "fondo_oscuro.png", "fondo Oscuro.png", "fondo_oscuro.jpg", "fondo Oscuro.jpg",
+            "fondo_pantalla.png", "fondo pantalla.png"
+        ) or self.ruta_fondo_claro
+        self.ruta_logo = buscar_recurso("Logo.png", "Logo_Taller_Automotriz.png")
+        self._cache_fondos = {}
 
-        self.ruta_logo = "Logo.png"
-
-       
+        # VARIABLES DE SESIÓN Y CONTROL (SESIÓN ÚNICA)
         self.usuario_actual = ""
         self.rol_actual = ""
         self.id_usuario_actual = None
-        self.codigo_verificacion_generado = None
-        self.id_usuario_recuperando = None
+        self.token_sesion_actual = None
+
+        # TEMPORIZADORES DE SEGURIDAD
+        self.ultimo_actividad = time.time()
+        self.bloqueo_pantalla_activo = False
+        self.win_unlock_ref = None
+        self.win_duplicado_ref = None
+        self.ventanas_flotantes = []
 
         self.frame_login = None
         self.frame_registro = None
         self.frame_inicio = None
         self.body_scroll = None
         self.btn_menu_activos = {}
+        self.btn_registrar_container = None
+
+        # REGISTRO GLOBAL DE EVENTOS DE INTERACCIÓN
+        self.bind_all("<Any-KeyPress>", self.detectar_actividad_usuario)
+        self.bind_all("<Any-ButtonPress>", self.detectar_actividad_usuario)
+        self.bind_all("<Motion>", self.detectar_actividad_usuario)
 
         # IMAGEN DE FONDO GLOBAL
         self.lbl_bg = ctk.CTkLabel(self, text="")
@@ -61,139 +123,380 @@ class AppTallerAutomotriz(ctk.CTk):
 
         # BOTÓN Y FOOTER FLOTANTES
         self.btn_theme_login = ctk.CTkButton(
-            self, text="☀️ / 🌙 Tema", width=110, height=36,
+            self, text="☀️ / 🌙", width=80, height=38, corner_radius=10,
             fg_color=("#E5E7EB", "#2A2D34"), text_color=("#111827", "#F9FAFB"),
-            hover_color=("#D1D5DB", "#374151"), font=("Calibri", 13, "bold"),
+            hover_color=("#D1D5DB", "#374151"), font=("Segoe UI Emoji", 15, "bold"),
             command=self.cambiar_tema
         )
         self.btn_theme_login.place(relx=0.03, rely=0.96, anchor="w")
 
         self.footer = ctk.CTkFrame(
-            self, fg_color=("#FFFFFF", "#1E1E1E"), corner_radius=10, border_width=1, border_color=("#D1D5DB", "#2A2D34")
+            self, fg_color=("#FFFFFF", "#1E1E1E"), corner_radius=10, border_width=1,
+            border_color=("#D1D5DB", "#2A2D34")
         )
-        self.lbl_footer_text = ctk.CTkLabel(
+        ctk.CTkLabel(
             self.footer, text="⚙️ TALLER AUTOMOTRIZ I.G - SOFTWARE DE GESTIÓN",
-            font=("Calibri", 15, "bold"), text_color="#D32F2F"
-        )
-        self.lbl_footer_text.pack(padx=24, pady=8)
+            font=("Calibri", 15, "bold"), text_color=ROJO
+        ).pack(padx=24, pady=8)
         self.footer.place(relx=0.5, rely=0.96, anchor="center")
 
         self.actualizar_visibilidad_fondo()
         self.mostrar_login()
+        self.verificar_tiempos_inactividad_loop()
+        self.verificar_sesion_activa_loop()
 
+    # =========================================================================
+    # INACTIVIDAD Y CONTROL DE SESIÓN ÚNICA
+    # =========================================================================
+    def detectar_actividad_usuario(self, event=None):
+        if self.id_usuario_actual and self.frame_inicio and not self.bloqueo_pantalla_activo:
+            self.ultimo_actividad = time.time()
+
+    def verificar_tiempos_inactividad_loop(self):
+        self.after(5000, self.verificar_tiempos_inactividad_loop)
+
+        if not (self.id_usuario_actual and self.frame_inicio):
+            return
+
+        inactivo = time.time() - self.ultimo_actividad
+
+        if inactivo >= TIEMPO_EXPIRACION_SEG:
+            self.registrar_log("Cierre de sesión automático por inactividad de 5 minutos")
+            self.cerrar_sesion_forzado()
+            messagebox.showwarning(
+                "Sesión Expirada ⏱",
+                "Su sesión se ha cerrado automáticamente por superar los 5 minutos de inactividad."
+            )
+
+        elif inactivo >= TIEMPO_BLOQUEO_SEG and not self.bloqueo_pantalla_activo:
+            self.bloqueo_pantalla_activo = True
+            self.ultimo_actividad = time.time()
+            self.registrar_log("Pantalla bloqueada por inactividad (2.5 min)")
+            self.solicitar_clave_desbloqueo()
+
+    def verificar_sesion_activa_loop(self):
+        """Comprueba cada 3 segundos si el token cambió porque se inició sesión en la PWA."""
+        self.after(3000, self.verificar_sesion_activa_loop)
+
+        if self.id_usuario_actual and self.token_sesion_actual and self.frame_inicio:
+            valida = validar_sesion_activa(self.id_usuario_actual, self.token_sesion_actual)
+            if not valida and not self.win_duplicado_ref:
+                self.mostrar_modal_sesion_duplicada()
+
+    def mostrar_modal_sesion_duplicada(self):
+        """Modal estilo WhatsApp Web con opciones 'Usar aquí' o 'Cerrar sesión'."""
+        self.cerrar_modal_desbloqueo()
+
+        win = ctk.CTkToplevel(self)
+        win.title("Sesión Abierta en Otro Dispositivo")
+        win.resizable(False, False)
+        SeguridadService.centrar_ventana(win, 480, 260)
+        win.transient(self)
+        win.after(150, win.grab_set)
+        self.win_duplicado_ref = win
+
+        def cerrar_y_salir():
+            try:
+                win.grab_release()
+                win.destroy()
+            except Exception:
+                pass
+            self.win_duplicado_ref = None
+            self.cerrar_sesion_forzado()
+
+        def usar_aqui():
+            nuevo_token = str(uuid.uuid4())
+            if retomar_sesion(self.id_usuario_actual, nuevo_token, 'ESCRITORIO'):
+                self.token_sesion_actual = nuevo_token
+                self.ultimo_actividad = time.time()
+                self.registrar_log("Usuario seleccionó 'Usar aquí' la sesión en Escritorio")
+                try:
+                    win.grab_release()
+                    win.destroy()
+                except Exception:
+                    pass
+                self.win_duplicado_ref = None
+            else:
+                messagebox.showerror("Error ❌", "No se pudo retomar la sesión.", parent=win)
+
+        win.protocol("WM_DELETE_WINDOW", cerrar_y_salir)
+
+        card = ctk.CTkFrame(win, fg_color=CARD_BG, corner_radius=16, border_width=1, border_color=CARD_BORDE)
+        card.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(
+            card, 
+            text="📱 SESIÓN ABIERTA EN OTRA VENTANA", 
+            font=("Calibri", 17, "bold"), 
+            text_color=ROJO
+        ).pack(pady=(15, 8))
+
+        msg = (
+            "El Taller Automotriz está abierto en otro dispositivo (PWA Web).\n"
+            "¿Desea usar la aplicación aquí o cerrar la sesión?"
+        )
+        ctk.CTkLabel(
+            card, 
+            text=msg, 
+            font=("Calibri", 14), 
+            text_color=TXT_T, 
+            justify="center",
+            wraplength=420
+        ).pack(pady=(0, 20))
+
+        btn_container = ctk.CTkFrame(card, fg_color="transparent")
+        btn_container.pack(fill="x", padx=10)
+
+        ctk.CTkButton(
+            btn_container, 
+            text="Cerrar Sesión", 
+            width=180, 
+            height=40, 
+            fg_color=BTN_GRIS, 
+            hover_color=BTN_GRIS_H,
+            text_color=TXT_T,
+            font=("Calibri", 14, "bold"), 
+            command=cerrar_y_salir
+        ).pack(side="left", padx=10)
+
+        ctk.CTkButton(
+            btn_container, 
+            text="Usar aquí", 
+            width=180, 
+            height=40, 
+            fg_color=ROJO, 
+            hover_color=ROJO_H,
+            font=("Calibri", 14, "bold"), 
+            command=usar_aqui
+        ).pack(side="right", padx=10)
+
+    def cerrar_modal_desbloqueo(self):
+        w = self.win_unlock_ref
+        self.win_unlock_ref = None
+        if w is not None:
+            try:
+                if w.winfo_exists():
+                    w.grab_release()
+                    w.destroy()
+            except Exception:
+                pass
+
+    def cerrar_ventanas_flotantes(self):
+        for w in self.ventanas_flotantes:
+            try:
+                if w.winfo_exists():
+                    w.grab_release()
+                    w.destroy()
+            except Exception:
+                pass
+        self.ventanas_flotantes.clear()
+
+    def solicitar_clave_desbloqueo(self):
+        self.cerrar_modal_desbloqueo()
+
+        win = ctk.CTkToplevel(self)
+        win.title("Sesión Bloqueada")
+        win.resizable(False, False)
+        SeguridadService.centrar_ventana(win, 420, 290)
+        win.transient(self)
+        win.after(150, win.grab_set)
+        self.win_unlock_ref = win
+        intentos = {"n": 0}
+
+        def al_cerrar_con_x():
+            messagebox.showwarning(
+                "Seguridad 🔒",
+                "No puede omitir el desbloqueo. Debe ingresar su contraseña para continuar.",
+                parent=win
+            )
+            txt_p.focus_force()
+
+        win.protocol("WM_DELETE_WINDOW", al_cerrar_con_x)
+
+        ctk.CTkLabel(win, text="🔒 SESIÓN BLOQUEADA", font=("Calibri", 20, "bold"), text_color=ROJO).pack(pady=(20, 5))
+        ctk.CTkLabel(win, text="Sistema bloqueado por inactividad.\nIngrese su contraseña para continuar:",
+                     font=("Calibri", 14), justify="center").pack(pady=(0, 15))
+
+        txt_p = ctk.CTkEntry(win, width=320, height=42, show="•", placeholder_text="Ingrese su contraseña", font=("Calibri", 15))
+        txt_p.pack(pady=(0, 15))
+        txt_p.focus_force()
+        txt_p.bind("<Return>", lambda e: validar())
+
+        def validar():
+            pas = txt_p.get()
+            if not pas:
+                messagebox.showwarning("Atención ⚠️", "Ingrese su contraseña.", parent=win)
+                return
+            try:
+                with conexion_db(True) as (con, cur):
+                    cur.execute("SELECT password_hash FROM usuarios WHERE id_usuario = %s", (self.id_usuario_actual,))
+                    u = cur.fetchone()
+            except mysql.connector.Error as err:
+                messagebox.showerror("Error ❌", str(err), parent=win)
+                return
+
+            if u and SeguridadService.verificar(pas, u['password_hash']):
+                self.bloqueo_pantalla_activo = False
+                self.ultimo_actividad = time.time()
+                self.registrar_log("Sesión desbloqueada")
+                self.cerrar_modal_desbloqueo()
+            else:
+                intentos["n"] += 1
+                if intentos["n"] >= MAX_INTENTOS_DESBLOQUEO:
+                    self.registrar_log("Cierre de sesión: demasiados intentos fallidos al desbloquear")
+                    messagebox.showerror("Seguridad 🔒", "Demasiados intentos incorrectos. Se cerrará la sesión.", parent=win)
+                    self.cerrar_sesion_forzado()
+                else:
+                    messagebox.showerror("Error ❌", f"Contraseña incorrecta.\nIntentos restantes: {MAX_INTENTOS_DESBLOQUEO - intentos['n']}", parent=win)
+                    txt_p.delete(0, "end")
+
+        ctk.CTkButton(win, text="Desbloquear 🔓", height=42, width=320, fg_color=ROJO, hover_color=ROJO_H,
+                      font=("Calibri", 15, "bold"), command=validar).pack()
+
+    # =========================================================================
+    # TEMA, FONDO Y UTILIDADES
+    # =========================================================================
     def cambiar_tema(self):
-        modo_actual = ctk.get_appearance_mode()
-        nuevo_modo = "Dark" if modo_actual == "Light" else "Light"
-        ctk.set_appearance_mode(nuevo_modo)
-        
+        nuevo = "Dark" if ctk.get_appearance_mode() == "Light" else "Light"
+        ctk.set_appearance_mode(nuevo)
         self.actualizar_visibilidad_fondo()
 
-        if self.btn_menu_activos:
-            for clave in self.btn_menu_activos:
-                if self.btn_menu_activos[clave].cget("fg_color") not in ["transparent", ("transparent", "transparent")]:
+        for clave, btn in self.btn_menu_activos.items():
+            try:
+                if btn.cget("fg_color") not in ["transparent", ("transparent", "transparent")]:
                     self.seleccionar_opcion_menu(clave)
                     break
+            except Exception:
+                pass
 
     def actualizar_visibilidad_fondo(self):
         if not hasattr(self, 'lbl_bg'):
             return
-
-        modo_actual = ctk.get_appearance_mode()
-        ruta_usar = self.ruta_fondo_oscuro if modo_actual == "Dark" and os.path.exists(self.ruta_fondo_oscuro) else self.ruta_fondo_claro
-
-        if os.path.exists(ruta_usar):
-            ancho_p = self.winfo_screenwidth()
-            alto_p = self.winfo_screenheight()
-            
-            img_bg_obj = Image.open(ruta_usar).resize((ancho_p, alto_p), Image.Resampling.LANCZOS)
-            self.img_bg_ctk = ctk.CTkImage(light_image=img_bg_obj, dark_image=img_bg_obj, size=(ancho_p, alto_p))
-            self.lbl_bg.configure(image=self.img_bg_ctk)
-            self.lbl_bg.place(x=0, y=0, relwidth=1, relheight=1)
-            self.lbl_bg.lower()
+        ruta = self.ruta_fondo_oscuro if ctk.get_appearance_mode() == "Dark" else self.ruta_fondo_claro
+        if not ruta:
+            return
+        if ruta not in self._cache_fondos:
+            w, h = self.winfo_screenwidth(), self.winfo_screenheight()
+            img = Image.open(ruta).convert("RGB").resize((w, h), Image.Resampling.LANCZOS)
+            self._cache_fondos[ruta] = ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
+        self.lbl_bg.configure(image=self._cache_fondos[ruta])
+        self.lbl_bg.place(x=0, y=0, relwidth=1, relheight=1)
+        self.lbl_bg.lower()
 
     def hacer_imagen_circular(self, ruta_img, tamano):
-        img_original = Image.open(ruta_img).convert("RGBA").resize(tamano, Image.Resampling.LANCZOS)
+        img = Image.open(ruta_img).convert("RGBA").resize(tamano, Image.Resampling.LANCZOS)
         mascara = Image.new("L", tamano, 0)
-        draw = ImageDraw.Draw(mascara)
-        draw.ellipse((0, 0, tamano[0], tamano[1]), fill=255)
-        resultado = Image.new("RGBA", tamano, (255, 255, 255, 0))
-        resultado.paste(img_original, (0, 0), mascara)
-        return resultado
+        ImageDraw.Draw(mascara).ellipse((0, 0, tamano[0], tamano[1]), fill=255)
+        res = Image.new("RGBA", tamano, (255, 255, 255, 0))
+        res.paste(img, (0, 0), mascara)
+        return res
 
-    def registrar_log(self, accion):
+    def _logo(self, tam):
+        if not self.ruta_logo:
+            return None
+        img = self.hacer_imagen_circular(self.ruta_logo, (tam, tam))
+        return ctk.CTkImage(light_image=img, dark_image=img, size=(tam, tam))
+
+    def registrar_log(self, accion, usuario=None, rol=None):
         try:
-            conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-            cursor = conexion.cursor()
-            sql = "INSERT INTO logs_sistema (usuario, rol, accion) VALUES (%s, %s, %s)"
-            cursor.execute(sql, (self.usuario_actual if self.usuario_actual else "Sistema/Anonimo", self.rol_actual if self.rol_actual else "Invitado", accion))
-            conexion.commit()
-            cursor.close()
-            conexion.close()
+            with conexion_db() as (con, cur):
+                cur.execute(
+                    "INSERT INTO logs_sistema (usuario, rol, accion) VALUES (%s, %s, %s)",
+                    (usuario or self.usuario_actual or "Sistema/Anonimo", rol or self.rol_actual or "Invitado", accion)
+                )
+                con.commit()
         except mysql.connector.Error as err:
             print(f"Error registrando log: {err}")
 
+    def tiene_rol(self, *roles):
+        if not self.id_usuario_actual or normalizar_rol(self.rol_actual) not in roles:
+            self.registrar_log(f"Acceso denegado: rol '{self.rol_actual}' intentó una acción de {roles}")
+            messagebox.showerror("Acceso denegado 🚫", "No tiene permisos para realizar esta acción.")
+            return False
+        return True
+
     def obtener_conteo_real(self, consulta_sql):
         try:
-            conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-            cursor = conexion.cursor()
-            cursor.execute(consulta_sql)
-            res = cursor.fetchone()
-            cursor.close()
-            conexion.close()
-            return int(res[0]) if res and res[0] is not None else 0
+            with conexion_db() as (con, cur):
+                cur.execute(consulta_sql)
+                res = cur.fetchone()
+                return int(res[0]) if res and res[0] is not None else 0
         except mysql.connector.Error:
             return 0
 
     def obtener_lista_clientes(self):
-        clientes_dict = {"Sin asignar": None}
+        clientes = {"Sin asignar": None}
         try:
-            conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-            cursor = conexion.cursor(dictionary=True)
-            cursor.execute("SELECT id_usuario, nombre_completo, usuario FROM usuarios WHERE LOWER(rol) LIKE '%cliente%'")
-            rows = cursor.fetchall()
-            for r in rows:
-                label = f"#{r['id_usuario']} - {r['nombre_completo']} ({r['usuario']})"
-                clientes_dict[label] = r['id_usuario']
-            cursor.close()
-            conexion.close()
+            with conexion_db(True) as (con, cur):
+                cur.execute("SELECT id_usuario, nombre_completo, usuario FROM usuarios WHERE LOWER(rol) LIKE '%cliente%'")
+                for r in cur.fetchall():
+                    clientes[f"#{r['id_usuario']} - {r['nombre_completo']} ({r['usuario']})"] = r['id_usuario']
         except mysql.connector.Error:
             pass
-        return clientes_dict
+        return clientes
 
     def seleccionar_opcion_menu(self, clave_opcion):
         modo = ctk.get_appearance_mode()
         for clave, btn in self.btn_menu_activos.items():
-            if clave == clave_opcion:
-                if modo == "Light":
-                    btn.configure(fg_color="#FFF0F0", text_color="#D32F2F", hover_color="#FFE0E0")
+            try:
+                if clave == clave_opcion:
+                    if modo == "Light":
+                        btn.configure(fg_color="#FFF0F0", text_color=ROJO, hover_color="#FFE0E0")
+                    else:
+                        btn.configure(fg_color="#2B1819", text_color="#FF5252", hover_color="#3A2022")
                 else:
-                    btn.configure(fg_color="#2B1819", text_color="#FF5252", hover_color="#3A2022")
-            else:
-                btn.configure(fg_color="transparent", text_color=("#222222", "#E0E0E0"), hover_color=("#F5F5F5", "#2B2B2B"))
+                    btn.configure(fg_color="transparent", text_color=("#222222", "#E0E0E0"), hover_color=("#F5F5F5", "#2B2B2B"))
+            except Exception:
+                pass
+
+    # ------------------ VENTANAS FLOTANTES ------------------
+    def crear_ventana_flotante(self, titulo, ancho=480, alto=460):
+        win = ctk.CTkToplevel(self)
+        win.title(titulo)
+        win.resizable(False, False)
+        SeguridadService.centrar_ventana(win, ancho, alto)
+        win.transient(self)
+        win.after(150, win.grab_set)
+        win.after(200, win.focus_force)
+        self.ventanas_flotantes.append(win)
+
+        ctk.CTkLabel(win, text=titulo, font=("Calibri", 22, "bold"), text_color=ROJO).pack(pady=(18, 8))
+        cuerpo = ctk.CTkFrame(win, fg_color="transparent")
+        cuerpo.pack(fill="both", expand=True, padx=28, pady=(0, 18))
+        return win, cuerpo
+
+    def _campo(self, parent, etiqueta, placeholder="", show=None, alto=38):
+        ctk.CTkLabel(parent, text=etiqueta, font=("Calibri", 15, "bold"), text_color=("#111827", "#FFFFFF")).pack(anchor="w")
+        e = ctk.CTkEntry(parent, height=alto, placeholder_text=placeholder, font=("Calibri", 15), show=show)
+        e.pack(fill="x", pady=(2, 10))
+        return e
+
+    def _barra_botones(self, parent, texto_guardar, comando, win):
+        barra = ctk.CTkFrame(parent, fg_color="transparent")
+        barra.pack(fill="x", side="bottom", pady=(8, 0))
+        ctk.CTkButton(barra, text="Cancelar", width=130, height=42, fg_color=BTN_GRIS, hover_color=BTN_GRIS_H,
+                      text_color=TXT_T, font=("Calibri", 15, "bold"), command=win.destroy).pack(side="left")
+        ctk.CTkButton(barra, text=texto_guardar, width=210, height=42, fg_color=ROJO, hover_color=ROJO_H,
+                      font=("Calibri", 15, "bold"), command=comando).pack(side="right")
+
+    def _encabezado_body(self, titulo, subtitulo):
+        ctk.CTkLabel(self.body_scroll, text=titulo, font=("Calibri", 26, "bold"), text_color=TXT_T).pack(pady=(15, 2))
+        ctk.CTkLabel(self.body_scroll, text=subtitulo, font=("Calibri", 16), text_color=TXT_S).pack(pady=(0, 15))
 
     # =========================================================================
-    # LOGIN & RECUPERACIÓN (RESTAURADA LÍNEA ROJA)
+    # LOGIN Y RECUPERACIÓN DE CONTRASEÑA
     # =========================================================================
     def mostrar_login(self):
-        if self.frame_registro:
-            self.frame_registro.destroy()
-            self.frame_registro = None
-        if self.frame_inicio:
-            self.frame_inicio.destroy()
-            self.frame_inicio = None
-        if self.frame_login:
-            self.frame_login.destroy()
-            self.frame_login = None
+        for attr in ("frame_registro", "frame_inicio", "frame_login"):
+            f = getattr(self, attr)
+            if f:
+                f.destroy()
+                setattr(self, attr, None)
 
         self.actualizar_visibilidad_fondo()
         self.btn_theme_login.place(relx=0.03, rely=0.96, anchor="w")
         self.footer.place(relx=0.5, rely=0.96, anchor="center")
-        
-        self.card_main.configure(
-            fg_color=("#FFFFFF", "#121214"), 
-            border_color=("#D1D5DB", "#2A2D34"), 
-            border_width=1
-        )
+        self.card_main.configure(fg_color=("#FFFFFF", "#121214"), border_color=("#D1D5DB", "#2A2D34"), border_width=1)
         self.card_main.place(relx=0.5, rely=0.47, anchor="center")
 
         self.frame_login = ctk.CTkFrame(self.card_main, fg_color="transparent")
@@ -205,21 +508,18 @@ class AppTallerAutomotriz(ctk.CTk):
         logo_center = ctk.CTkFrame(left_f, fg_color="transparent")
         logo_center.place(relx=0.5, rely=0.46, anchor="center")
 
-        if os.path.exists(self.ruta_logo):
-            img_c = self.hacer_imagen_circular(self.ruta_logo, (330, 330))
-            img_l = ctk.CTkImage(light_image=img_c, dark_image=img_c, size=(330, 330))
+        img_l = self._logo(330)
+        if img_l:
             ctk.CTkLabel(logo_center, image=img_l, text="").pack(pady=(0, 15))
 
-        slogan_frame = ctk.CTkFrame(logo_center, fg_color="transparent")
-        slogan_frame.pack()
+        slogan = ctk.CTkFrame(logo_center, fg_color="transparent")
+        slogan.pack()
+        ctk.CTkFrame(slogan, width=30, height=2, fg_color=ROJO).pack(side="left", padx=6)
+        ctk.CTkLabel(slogan, text="Tu vehículo en las mejores manos", font=("Calibri", 15, "italic", "bold"),
+                     text_color=("#444444", "#DDDDDD")).pack(side="left")
+        ctk.CTkFrame(slogan, width=30, height=2, fg_color=ROJO).pack(side="right", padx=6)
 
-        ctk.CTkFrame(slogan_frame, width=30, height=2, fg_color="#D32F2F").pack(side="left", padx=6)
-        ctk.CTkLabel(slogan_frame, text="Tu vehículo en las mejores manos", font=("Calibri", 15, "italic", "bold"), text_color=("#444444", "#DDDDDD")).pack(side="left")
-        ctk.CTkFrame(slogan_frame, width=30, height=2, fg_color="#D32F2F").pack(side="right", padx=6)
-
-        # LÍNEA DIVISORIA ROJA DEL LOGIN
-        divider = ctk.CTkFrame(self.frame_login, width=3, fg_color="#D32F2F", corner_radius=1)
-        divider.pack(side="left", fill="y", pady=15)
+        ctk.CTkFrame(self.frame_login, width=3, fg_color=ROJO, corner_radius=1).pack(side="left", fill="y", pady=15)
 
         right_f = ctk.CTkFrame(self.frame_login, fg_color="transparent")
         right_f.pack(side="right", fill="both", expand=True, padx=(10, 10))
@@ -227,155 +527,245 @@ class AppTallerAutomotriz(ctk.CTk):
         form_c = ctk.CTkFrame(right_f, fg_color="transparent")
         form_c.place(relx=0.5, rely=0.48, anchor="center")
 
-        ctk.CTkLabel(form_c, text="👤", font=("Segoe UI Emoji", 42), text_color="#D32F2F").pack(pady=(0, 2))
+        ctk.CTkLabel(form_c, text="👤", font=("Segoe UI Emoji", 42), text_color=ROJO).pack(pady=(0, 2))
         ctk.CTkLabel(form_c, text="INICIO DE SESIÓN", font=("Calibri", 28, "bold"), text_color=("#000000", "#FFFFFF")).pack(pady=(0, 4))
-        ctk.CTkLabel(form_c, text="Ingresa tus datos para acceder al sistema", font=("Calibri", 15), text_color=("#555555", "#AAAAAA")).pack(pady=(0, 18))
+        ctk.CTkLabel(form_c, text="Ingresa tus datos para acceder al sistema", font=("Calibri", 15),
+                     text_color=("#555555", "#AAAAAA")).pack(pady=(0, 18))
+
+        # HONEYPOT
+        self.txt_honeypot = ctk.CTkEntry(form_c, width=10, height=10, border_width=0)
+        self.txt_honeypot.place(x=-600, y=-600)
+        try:
+            self.txt_honeypot._entry.configure(takefocus=0)
+        except Exception:
+            pass
 
         ctk.CTkLabel(form_c, text="👤  Usuario:", font=("Calibri", 15, "bold"), text_color=("#000000", "#FFFFFF")).pack(anchor="w", pady=(0, 4))
-        self.txt_user_login = ctk.CTkEntry(
-            form_c, width=350, height=46, corner_radius=10, 
-            placeholder_text="Ingrese su usuario", font=("Calibri", 15), 
-            fg_color=("#FAFAFA", "#1A1A1E"), border_width=1.5, border_color=("#B0B0B0", "#333338")
-        )
+        self.txt_user_login = ctk.CTkEntry(form_c, width=350, height=46, corner_radius=10, placeholder_text="Ingrese su usuario",
+                                           font=("Calibri", 15), fg_color=("#FAFAFA", "#1A1A1E"), border_width=1.5,
+                                           border_color=("#B0B0B0", "#333338"))
         self.txt_user_login.pack(pady=(0, 14))
 
         ctk.CTkLabel(form_c, text="🔒  Contraseña:", font=("Calibri", 15, "bold"), text_color=("#000000", "#FFFFFF")).pack(anchor="w", pady=(0, 4))
         pass_f = ctk.CTkFrame(form_c, fg_color="transparent")
         pass_f.pack(pady=(0, 6))
 
-        self.txt_pass_login = ctk.CTkEntry(
-            pass_f, width=294, height=46, corner_radius=10, show="•", 
-            placeholder_text="Ingrese su contraseña", font=("Calibri", 15), 
-            fg_color=("#FAFAFA", "#1A1A1E"), border_width=1.5, border_color=("#B0B0B0", "#333338")
-        )
+        self.txt_pass_login = ctk.CTkEntry(pass_f, width=294, height=46, corner_radius=10, show="•",
+                                           placeholder_text="Ingrese su contraseña", font=("Calibri", 15),
+                                           fg_color=("#FAFAFA", "#1A1A1E"), border_width=1.5,
+                                           border_color=("#B0B0B0", "#333338"))
         self.txt_pass_login.pack(side="left", padx=(0, 6))
+        self.txt_pass_login.bind("<Return>", lambda e: self.validar_login())
 
-        self.mostrando_p_login = False
-        def toggle_p_login():
-            if self.mostrando_p_login:
-                self.txt_pass_login.configure(show="•")
-                btn_p.configure(text="👁️")
-                self.mostrando_p_login = False
-            else:
-                self.txt_pass_login.configure(show="")
-                btn_p.configure(text="🙈")
-                self.mostrando_p_login = True
+        estado_ojo = {"ver": False}
 
-        btn_p = ctk.CTkButton(
-            pass_f, text="👁️", width=50, height=46, corner_radius=10, 
-            fg_color=("#E0E0E0", "#25252A"), text_color=("#000", "#FFF"), 
-            hover_color=("#CCCCCC", "#333338"), font=("Segoe UI Emoji", 18), 
-            command=toggle_p_login
-        )
-        btn_p.pack(side="right")
+        def toggle_pass():
+            estado_ojo["ver"] = not estado_ojo["ver"]
+            self.txt_pass_login.configure(show="" if estado_ojo["ver"] else "•")
+            btn_ojo.configure(text="🙈" if estado_ojo["ver"] else "👁️")
 
-        ctk.CTkButton(
-            form_c, text=" ¿Olvidó su contraseña?", font=("Calibri", 14, "underline"), 
-            text_color=("#444444", "#CCCCCC"), hover_color=("#FFFFFF", "#121214"), 
-            fg_color="transparent", width=100, command=self.recuperar_contrasena
-        ).pack(anchor="e", pady=(0, 16))
+        btn_ojo = ctk.CTkButton(pass_f, text="👁️", width=50, height=46, corner_radius=10, fg_color=("#E0E0E0", "#25252A"),
+                                text_color=("#000", "#FFF"), hover_color=("#CCCCCC", "#333338"),
+                                font=("Segoe UI Emoji", 18), command=toggle_pass)
+        btn_ojo.pack(side="right")
 
-        ctk.CTkButton(
-            form_c, text="➔  INICIAR SESIÓN", width=350, height=48, corner_radius=10, 
-            fg_color="#D32F2F", hover_color="#B71C1C", font=("Calibri", 17, "bold"), 
-            command=self.validar_login
-        ).pack(pady=(0, 10))
+        ctk.CTkButton(form_c, text=" ¿Olvidó su contraseña?", font=("Calibri", 14, "underline"), text_color=("#444444", "#CCCCCC"),
+                      hover_color=("#FFFFFF", "#121214"), fg_color="transparent", width=100,
+                      command=self.recuperar_contrasena).pack(anchor="e", pady=(0, 16))
+        ctk.CTkButton(form_c, text="➔  INICIAR SESIÓN", width=350, height=48, corner_radius=10, fg_color=ROJO, hover_color=ROJO_H,
+                      font=("Calibri", 17, "bold"), command=self.validar_login).pack(pady=(0, 10))
+        ctk.CTkButton(form_c, text="¿No tiene cuenta? Regístrese aquí", font=("Calibri", 15, "bold"), text_color=ROJO,
+                      hover_color=("#FFFFFF", "#121214"), fg_color="transparent", command=self.mostrar_registro).pack()
 
-        ctk.CTkButton(
-            form_c, text="¿No tiene cuenta? Regístrese aquí", font=("Calibri", 15, "bold"), 
-            text_color="#D32F2F", hover_color=("#FFFFFF", "#121214"), fg_color="transparent", 
-            command=self.mostrar_registro
-        ).pack()
+    def validar_login(self):
+        if SeguridadService.validar_honeypot(self.txt_honeypot):
+            self.registrar_log("Posible bot detectado (honeypot lleno) en el login", usuario="Anónimo", rol="Invitado")
+            return
+
+        usr = self.txt_user_login.get().strip()
+        pas = self.txt_pass_login.get()
+
+        if not usr or not pas:
+            messagebox.showwarning("Datos Incompletos ⚠️", "Ingrese usuario y contraseña.")
+            return
+
+        try:
+            with conexion_db(True) as (con, cur):
+                cur.execute(
+                    """SELECT id_usuario, nombre_completo, rol, password_hash, estado, intentos_fallidos,
+                              (bloqueado_hasta IS NOT NULL AND bloqueado_hasta > NOW()) AS bloqueado
+                       FROM usuarios WHERE usuario = %s""", (usr,))
+                user = cur.fetchone()
+
+                # 1. EL USUARIO NO EXISTE
+                if not user:
+                    self.registrar_log(f"Intento de login con usuario inexistente: '{usr}'", usuario=usr, rol="Invitado")
+                    messagebox.showerror("Error de Acceso ❌", f"El usuario '{usr}' no se encuentra registrado.")
+                    self.txt_pass_login.delete(0, "end")
+                    return
+
+                # 2. CUENTA BLOQUEADA POR INTENTOS FALLIDOS
+                if user['bloqueado']:
+                    self.registrar_log(f"Intento de acceso a cuenta bloqueada: {usr}", usuario=usr, rol="Invitado")
+                    messagebox.showwarning("Cuenta Bloqueada 🔒", f"Demasiados intentos fallidos.\nIntente de nuevo en {BLOQUEO_MINUTOS} minutos.")
+                    self.txt_pass_login.delete(0, "end")
+                    return
+
+                # 3. CUENTA INACTIVA
+                if user['estado'] != 'Activo':
+                    messagebox.showwarning("Cuenta Inactiva ⚠️", "Esta cuenta ha sido desactivada por la administración.")
+                    self.txt_pass_login.delete(0, "end")
+                    return
+
+                # 4. CONTRASEÑA INCORRECTA
+                if not SeguridadService.verificar(pas, user['password_hash']):
+                    n = (user['intentos_fallidos'] or 0) + 1
+                    if n >= MAX_INTENTOS_LOGIN:
+                        cur.execute(
+                            """UPDATE usuarios SET intentos_fallidos = 0,
+                               bloqueado_hasta = NOW() + INTERVAL %s MINUTE WHERE id_usuario = %s""",
+                            (BLOQUEO_MINUTOS, user['id_usuario']))
+                        con.commit()
+                        self.registrar_log(f"Cuenta '{usr}' bloqueada por {BLOQUEO_MINUTOS} min (intentos fallidos)", usuario=usr, rol="Invitado")
+                        messagebox.showerror(
+                            "Cuenta Bloqueada 🔒",
+                            f"Ha ingresado la contraseña incorrecta {MAX_INTENTOS_LOGIN} veces.\nSu cuenta ha sido bloqueada por {BLOQUEO_MINUTOS} minutos."
+                        )
+                    else:
+                        cur.execute("UPDATE usuarios SET intentos_fallidos = %s WHERE id_usuario = %s", (n, user['id_usuario']))
+                        con.commit()
+                        self.registrar_log(f"Contraseña incorrecta para el usuario '{usr}' (Intento {n})", usuario=usr, rol="Invitado")
+                        intentos_restantes = MAX_INTENTOS_LOGIN - n
+                        messagebox.showerror(
+                            "Contraseña Incorrecta ❌",
+                            f"La contraseña ingresada es incorrecta.\nIntentos restantes antes de bloquear: {intentos_restantes}"
+                        )
+                    self.txt_pass_login.delete(0, "end")
+                    return
+
+                # --- LOGIN EXITOSO ---
+                if SeguridadService.es_legacy(user['password_hash']) and len(pas.encode("utf-8")) <= 72:
+                    cur.execute("UPDATE usuarios SET password_hash = %s WHERE id_usuario = %s",
+                                (SeguridadService.hashear(pas), user['id_usuario']))
+
+                cur.execute("UPDATE usuarios SET intentos_fallidos = 0, bloqueado_hasta = NULL WHERE id_usuario = %s",
+                            (user['id_usuario'],))
+                con.commit()
+
+        except mysql.connector.Error as err:
+            messagebox.showerror("Error ❌", f"No se pudo conectar a MySQL:\n{err}")
+            return
+
+        self.usuario_actual = user['nombre_completo']
+        self.rol_actual = user['rol']
+        self.id_usuario_actual = user['id_usuario']
+        self.ultimo_actividad = time.time()
+        self.bloqueo_pantalla_activo = False
+
+        # Registrar Token de Sesión Única en la base de datos
+        self.token_sesion_actual = str(uuid.uuid4())
+        registrar_inicio_sesion(self.id_usuario_actual, self.token_sesion_actual, 'ESCRITORIO')
+
+        self.registrar_log("Inicio de sesión exitoso")
+        self.mostrar_inicio()
 
     def recuperar_contrasena(self):
-        win_rec = ctk.CTkToplevel(self)
-        win_rec.title("Recuperar Contraseña")
-        win_rec.geometry("500x580")
-        win_rec.resizable(False, False)
-        win_rec.grab_set()
+        win, cuerpo = self.crear_ventana_flotante("🔑 Recuperar Contraseña", 500, 610)
+        ctk.CTkLabel(cuerpo, text="Ingrese su usuario y teléfono para verificar su identidad", font=("Calibri", 14),
+                     text_color=("#222222", "#CCCCCC"), wraplength=440).pack(pady=(0, 10))
 
-        ctk.CTkLabel(win_rec, text="🔑 RECUPERAR CONTRASEÑA", font=("Calibri", 22, "bold"), text_color="#D32F2F").pack(pady=(20, 5))
-        ctk.CTkLabel(win_rec, text="Ingrese su usuario y teléfono para verificar su identidad", font=("Calibri", 15), text_color=("#222222", "#CCCCCC"), wraplength=440).pack(pady=(0, 15))
+        txt_user = self._campo(cuerpo, "Usuario:", "Ingrese su usuario")
+        txt_tel = self._campo(cuerpo, "Teléfono registrado:", "Ingrese su teléfono")
+        txt_cod = self._campo(cuerpo, "Código de verificación:", "Código de 6 dígitos")
+        txt_pas = self._campo(cuerpo, "Nueva contraseña:", "Mín. 8 caracteres, letras y números", show="•")
+        txt_cod.configure(state="disabled")
+        txt_pas.configure(state="disabled")
 
-        form_rec = ctk.CTkFrame(win_rec, fg_color="transparent")
-        form_rec.pack(padx=30, fill="x")
+        estado = {"cr": None}
 
-        ctk.CTkLabel(form_rec, text="Usuario:", font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).pack(anchor="w", pady=(2, 2))
-        txt_rec_user = ctk.CTkEntry(form_rec, width=440, height=44, placeholder_text="Ingrese su usuario", font=("Calibri", 16))
-        txt_rec_user.pack(pady=(0, 10))
-
-        ctk.CTkLabel(form_rec, text="Teléfono registrado:", font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).pack(anchor="w", pady=(2, 2))
-        txt_rec_tel = ctk.CTkEntry(form_rec, width=440, height=44, placeholder_text="Ingrese su teléfono", font=("Calibri", 16))
-        txt_rec_tel.pack(pady=(0, 10))
-
-        ctk.CTkLabel(form_rec, text="Código de verificación:", font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).pack(anchor="w", pady=(2, 2))
-        txt_rec_codigo = ctk.CTkEntry(form_rec, width=440, height=44, placeholder_text="Código de 6 dígitos", font=("Calibri", 16), state="disabled")
-        txt_rec_codigo.pack(pady=(0, 10))
-
-        ctk.CTkLabel(form_rec, text="Nueva contraseña:", font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).pack(anchor="w", pady=(2, 2))
-        txt_rec_pass = ctk.CTkEntry(form_rec, width=440, height=44, show="•", placeholder_text="Nueva contraseña", font=("Calibri", 16), state="disabled")
-        txt_rec_pass.pack(pady=(0, 18))
+        def bloquear_campos():
+            txt_cod.configure(state="disabled")
+            txt_pas.configure(state="disabled")
+            btn_rest.configure(state="disabled")
 
         def generar_codigo():
-            usr = txt_rec_user.get().strip()
-            tel = txt_rec_tel.get().strip()
+            usr, tel = txt_user.get().strip(), txt_tel.get().strip()
             if not usr or not tel:
-                messagebox.showwarning("Atención ⚠️", "Ingrese usuario y teléfono.", parent=win_rec)
+                messagebox.showwarning("Atención ⚠️", "Ingrese usuario y teléfono.", parent=win)
                 return
             try:
-                conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-                cursor = conexion.cursor(dictionary=True)
-                cursor.execute("SELECT id_usuario FROM usuarios WHERE usuario = %s AND telefono = %s", (usr, tel))
-                u = cursor.fetchone()
-                if u:
-                    self.id_usuario_recuperando = u['id_usuario']
-                    self.codigo_verificacion_generado = str(random.randint(100000, 999999))
-                    messagebox.showinfo("Código Generado 📱", f"Código de verificación: {self.codigo_verificacion_generado}", parent=win_rec)
-                    txt_rec_codigo.configure(state="normal")
-                    txt_rec_pass.configure(state="normal")
-                    btn_rest.configure(state="normal")
-                else:
-                    messagebox.showerror("Error ❌", "Los datos no coinciden.", parent=win_rec)
-                cursor.close()
-                conexion.close()
+                with conexion_db(True) as (con, cur):
+                    cur.execute("SELECT id_usuario FROM usuarios WHERE usuario = %s AND telefono = %s AND estado = 'Activo'", (usr, tel))
+                    u = cur.fetchone()
             except mysql.connector.Error as err:
-                messagebox.showerror("Error BD ❌", str(err), parent=win_rec)
+                messagebox.showerror("Error ❌", str(err), parent=win)
+                return
+
+            self.registrar_log(f"Solicitud de recuperación de contraseña para '{usr}'", usuario=usr, rol="Invitado")
+            if not u:
+                messagebox.showerror("Error ❌", "Los datos no coinciden.", parent=win)
+                return
+
+            estado["cr"] = CodigoRecuperacion(u['id_usuario'])
+            if MOSTRAR_CODIGO_EN_PANTALLA:
+                messagebox.showinfo("Código Generado 📱",
+                                    f"Código de verificación: {estado['cr'].codigo}\n\nVence en 5 minutos. Tiene 3 intentos.", parent=win)
+            txt_cod.configure(state="normal")
+            txt_pas.configure(state="normal")
+            btn_rest.configure(state="normal")
 
         def actualizar_clave():
-            if txt_rec_codigo.get().strip() != self.codigo_verificacion_generado:
-                messagebox.showerror("Error ❌", "Código incorrecto.", parent=win_rec)
+            cr = estado["cr"]
+            if not cr:
                 return
-            np = txt_rec_pass.get().strip()
-            if not np:
-                messagebox.showwarning("Atención ⚠️", "Ingrese la nueva clave.", parent=win_rec)
+            np_ = txt_pas.get()
+            errores = SeguridadService.validar_password(np_)
+            if errores:
+                messagebox.showwarning("Contraseña insegura ⚠️", "\n".join(errores), parent=win)
                 return
-            try:
-                ph = hashlib.sha256(np.encode()).hexdigest()
-                conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-                cursor = conexion.cursor()
-                cursor.execute("UPDATE usuarios SET password_hash = %s WHERE id_usuario = %s", (ph, self.id_usuario_recuperando))
-                conexion.commit()
-                messagebox.showinfo("Éxito 🎉", "Contraseña cambiada correctamente.", parent=win_rec)
-                cursor.close()
-                conexion.close()
-                win_rec.destroy()
-            except mysql.connector.Error as err:
-                messagebox.showerror("Error BD ❌", str(err), parent=win_rec)
 
-        ctk.CTkButton(form_rec, text="📱 Generar Código", height=44, font=("Calibri", 16, "bold"), fg_color="#D32F2F", hover_color="#B71C1C", command=generar_codigo).pack(fill="x", pady=(0, 10))
-        btn_rest = ctk.CTkButton(form_rec, text="Restablecer Contraseña", height=44, font=("Calibri", 16, "bold"), fg_color="#B71C1C", hover_color="#8B0000", state="disabled", command=actualizar_clave)
+            res = cr.verificar(txt_cod.get())
+            if res == "expirado":
+                estado["cr"] = None
+                bloquear_campos()
+                messagebox.showerror("Código vencido ⏱", "El código expiró. Genere uno nuevo.", parent=win)
+                return
+            if res == "agotado":
+                estado["cr"] = None
+                bloquear_campos()
+                messagebox.showerror("Error ❌", "Demasiados intentos. Genere un código nuevo.", parent=win)
+                return
+            if res == "incorrecto":
+                messagebox.showerror("Error ❌", "Código incorrecto.", parent=win)
+                return
+
+            try:
+                with conexion_db() as (con, cur):
+                    cur.execute("UPDATE usuarios SET password_hash = %s, intentos_fallidos = 0, bloqueado_hasta = NULL WHERE id_usuario = %s",
+                                (SeguridadService.hashear(np_), cr.id_usuario))
+                    con.commit()
+                self.registrar_log(f"Contraseña restablecida (usuario #{cr.id_usuario})", usuario=f"#{cr.id_usuario}", rol="Invitado")
+                estado["cr"] = None
+                messagebox.showinfo("Éxito 🎉", "Contraseña cambiada correctamente.", parent=win)
+                win.destroy()
+            except mysql.connector.Error as err:
+                messagebox.showerror("Error ❌", str(err), parent=win)
+
+        ctk.CTkButton(cuerpo, text="📱 Generar Código", height=42, font=("Calibri", 15, "bold"), fg_color=ROJO,
+                      hover_color=ROJO_H, command=generar_codigo).pack(fill="x", pady=(0, 8))
+        btn_rest = ctk.CTkButton(cuerpo, text="Restablecer Contraseña", height=42, font=("Calibri", 15, "bold"),
+                                  fg_color=ROJO_H, hover_color="#8B0000", state="disabled", command=actualizar_clave)
         btn_rest.pack(fill="x")
 
     # =========================================================================
-    # REGISTRO DE CLIENTES (PÚBLICO)
+    # REGISTRO DE CLIENTES
     # =========================================================================
     def mostrar_registro(self):
-        if self.frame_login:
-            self.frame_login.destroy()
-            self.frame_login = None
-        if self.frame_registro:
-            self.frame_registro.destroy()
-            self.frame_registro = None
+        for attr in ("frame_login", "frame_registro"):
+            f = getattr(self, attr)
+            if f:
+                f.destroy()
+                setattr(self, attr, None)
 
         self.actualizar_visibilidad_fondo()
         self.frame_registro = ctk.CTkFrame(self.card_main, fg_color="transparent")
@@ -383,181 +773,182 @@ class AppTallerAutomotriz(ctk.CTk):
 
         left_f = ctk.CTkFrame(self.frame_registro, fg_color="transparent")
         left_f.pack(side="left", fill="both", expand=True, padx=(0, 15))
+        left_c = ctk.CTkFrame(left_f, fg_color="transparent")
+        left_c.place(relx=0.5, rely=0.5, anchor="center")
 
-        left_center_f = ctk.CTkFrame(left_f, fg_color="transparent")
-        left_center_f.place(relx=0.5, rely=0.5, anchor="center")
+        img_l = self._logo(280)
+        if img_l:
+            ctk.CTkLabel(left_c, image=img_l, text="").pack(pady=(0, 15))
+        ctk.CTkLabel(left_c, text="Taller Automotriz I.G", font=("Calibri", 26, "bold"), text_color=ROJO).pack(pady=(0, 4))
+        ctk.CTkLabel(left_c, text="Crea tu cuenta de Cliente para acceder\ny consultar tus servicios automotrices.",
+                     font=("Calibri", 16), text_color=("#222222", "#CCCCCC"), justify="center").pack()
 
-        if os.path.exists(self.ruta_logo):
-            img_c = self.hacer_imagen_circular(self.ruta_logo, (280, 280))
-            img_l = ctk.CTkImage(light_image=img_c, dark_image=img_c, size=(280, 280))
-            ctk.CTkLabel(left_center_f, image=img_l, text="").pack(pady=(0, 15))
-
-        ctk.CTkLabel(left_center_f, text="Taller Automotriz I.G", font=("Calibri", 26, "bold"), text_color="#D32F2F").pack(pady=(0, 4))
-        ctk.CTkLabel(left_center_f, text="Crea tu cuenta de Cliente para acceder\ny consultar tus servicios automotrices.", font=("Calibri", 16), text_color=("#222222", "#CCCCCC"), justify="center").pack()
-
-        divider = ctk.CTkFrame(self.frame_registro, width=3, fg_color="#D32F2F")
-        divider.pack(side="left", fill="y", pady=15)
+        ctk.CTkFrame(self.frame_registro, width=3, fg_color=ROJO).pack(side="left", fill="y", pady=15)
 
         right_f = ctk.CTkFrame(self.frame_registro, fg_color="transparent")
         right_f.pack(side="right", fill="both", expand=True, padx=(15, 0))
 
-        ctk.CTkLabel(right_f, text="👤+", font=("Segoe UI Emoji", 40), text_color="#D32F2F").pack(pady=(0, 2))
+        ctk.CTkLabel(right_f, text="👤+", font=("Segoe UI Emoji", 40), text_color=ROJO).pack(pady=(0, 2))
         ctk.CTkLabel(right_f, text="REGISTRO DE CLIENTES", font=("Calibri", 28, "bold"), text_color=("#000000", "#FFFFFF")).pack(pady=(0, 15))
 
         grid_f = ctk.CTkFrame(right_f, fg_color="transparent")
         grid_f.pack(fill="x", pady=5)
 
-        ctk.CTkLabel(grid_f, text="Nombre completo:", font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).grid(row=0, column=0, sticky="w", padx=8)
-        ctk.CTkLabel(grid_f, text="Usuario:", font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).grid(row=0, column=1, sticky="w", padx=8)
+        def etiqueta(texto, fila, col):
+            ctk.CTkLabel(grid_f, text=texto, font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).grid(row=fila, column=col, sticky="w", padx=8)
 
-        self.reg_nombre = ctk.CTkEntry(grid_f, width=240, height=44, corner_radius=8, placeholder_text="Ingrese su nombre", font=("Calibri", 16))
-        self.reg_nombre.grid(row=1, column=0, padx=8, pady=(3, 12))
+        def entrada(ph, fila, col, show=None):
+            e = ctk.CTkEntry(grid_f, width=240, height=44, corner_radius=8, placeholder_text=ph, font=("Calibri", 16), show=show)
+            e.grid(row=fila, column=col, padx=8, pady=(3, 12))
+            return e
 
-        self.reg_usuario = ctk.CTkEntry(grid_f, width=240, height=44, corner_radius=8, placeholder_text="Cree un usuario", font=("Calibri", 16))
-        self.reg_usuario.grid(row=1, column=1, padx=8, pady=(3, 12))
-
-        ctk.CTkLabel(grid_f, text="Correo electrónico:", font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).grid(row=2, column=0, sticky="w", padx=8)
-        ctk.CTkLabel(grid_f, text="Teléfono:", font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).grid(row=2, column=1, sticky="w", padx=8)
-
-        self.reg_correo = ctk.CTkEntry(grid_f, width=240, height=44, corner_radius=8, placeholder_text="ejemplo@correo.com", font=("Calibri", 16))
-        self.reg_correo.grid(row=3, column=0, padx=8, pady=(3, 12))
-
-        self.reg_telefono = ctk.CTkEntry(grid_f, width=240, height=44, corner_radius=8, placeholder_text="Máx 10 dígitos", font=("Calibri", 16))
-        self.reg_telefono.grid(row=3, column=1, padx=8, pady=(3, 12))
-
-        ctk.CTkLabel(grid_f, text="Contraseña:", font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).grid(row=4, column=0, sticky="w", padx=8)
-        ctk.CTkLabel(grid_f, text="Confirmar contraseña:", font=("Calibri", 16, "bold"), text_color=("#000", "#FFF")).grid(row=4, column=1, sticky="w", padx=8)
-
-        f_p1 = ctk.CTkFrame(grid_f, fg_color="transparent")
-        f_p1.grid(row=5, column=0, padx=8, pady=(3, 12), sticky="w")
-        self.reg_pass1 = ctk.CTkEntry(f_p1, width=210, height=44, show="•", placeholder_text="Contraseña", font=("Calibri", 16))
-        self.reg_pass1.pack(side="left", padx=(0, 5))
-
-        f_p2 = ctk.CTkFrame(grid_f, fg_color="transparent")
-        f_p2.grid(row=5, column=1, padx=8, pady=(3, 12), sticky="w")
-        self.reg_pass2 = ctk.CTkEntry(f_p2, width=210, height=44, show="•", placeholder_text="Confirme contraseña", font=("Calibri", 16))
-        self.reg_pass2.pack(side="left", padx=(0, 5))
+        etiqueta("Nombre completo:", 0, 0); etiqueta("Usuario:", 0, 1)
+        self.reg_nombre = entrada("Ingrese su nombre", 1, 0)
+        self.reg_usuario = entrada("Cree un usuario", 1, 1)
+        etiqueta("Correo electrónico:", 2, 0); etiqueta("Teléfono:", 2, 1)
+        self.reg_correo = entrada("ejemplo@correo.com", 3, 0)
+        self.reg_telefono = entrada("10 dígitos", 3, 1)
+        etiqueta("Contraseña:", 4, 0); etiqueta("Confirmar contraseña:", 4, 1)
+        self.reg_pass1 = entrada("Contraseña", 5, 0, show="•")
+        self.reg_pass2 = entrada("Confirme contraseña", 5, 1, show="•")
+        ctk.CTkLabel(grid_f, text="Mínimo 8 caracteres, con letras y números.", font=("Calibri", 13),
+                     text_color=("#6B7280", "#9CA3AF")).grid(row=6, column=0, columnspan=2, sticky="w", padx=8)
 
         btn_f = ctk.CTkFrame(right_f, fg_color="transparent")
         btn_f.pack(fill="x", padx=8, pady=(20, 5))
+        ctk.CTkButton(btn_f, text="CANCELAR", width=200, height=46, fg_color=("#F2F2F2", "#333333"), hover_color=("#E5E5E5", "#444444"),
+                      border_width=1, border_color="#B0B0B0", text_color=("#333333", "#FFFFFF"), font=("Calibri", 15, "bold"),
+                      corner_radius=8, command=self.mostrar_login).pack(side="left")
+        ctk.CTkButton(btn_f, text="👤+ CREAR CUENTA", width=230, height=46, fg_color=ROJO, hover_color=ROJO_H, text_color="#FFFFFF",
+                      font=("Calibri", 16, "bold"), corner_radius=8, command=self.solicitar_politica_y_guardar).pack(side="right")
 
-        ctk.CTkButton(
-            btn_f, text="CANCELAR", width=200, height=46, 
-            fg_color=("#F2F2F2", "#333333"), hover_color=("#E5E5E5", "#444444"), 
-            border_width=1, border_color="#B0B0B0", 
-            text_color=("#333333", "#FFFFFF"), font=("Calibri", 15, "bold"), 
-            corner_radius=8, command=self.mostrar_login
-        ).pack(side="left")
+    def validar_datos_usuario(self, nombre, usuario, correo, telefono, pass1, pass2=None):
+        errores = []
+        if len(nombre) < 3:
+            errores.append("• Ingrese el nombre completo.")
+        if not SeguridadService.validar_usuario(usuario):
+            errores.append("• El usuario debe tener 4 a 30 caracteres (letras, números, punto, guion o guion bajo).")
+        if not SeguridadService.validar_correo(correo):
+            errores.append("• El correo electrónico no es válido.")
+        if not SeguridadService.validar_telefono(telefono):
+            errores.append("• El teléfono debe tener exactamente 10 dígitos.")
+        errores += SeguridadService.validar_password(pass1)
+        if pass2 is not None and pass1 != pass2:
+            errores.append("• Las contraseñas no coinciden.")
+        return errores
 
-        ctk.CTkButton(
-            btn_f, text="👤+ CREAR CUENTA", width=230, height=46, 
-            fg_color="#D32F2F", hover_color="#B71C1C", 
-            text_color="#FFFFFF", font=("Calibri", 16, "bold"), 
-            corner_radius=8, command=self.guardar_registro
-        ).pack(side="right")
-
-    # =========================================================================
-    # VISTAS DE AUDITORÍA Y LISTADO/CRUD DE USUARIOS
-    # =========================================================================
-    def mostrar_historial_logs(self):
-        self.seleccionar_opcion_menu("logs")
-
-        if not hasattr(self, 'body_scroll') or not self.body_scroll:
+    def solicitar_politica_y_guardar(self):
+        errores = self.validar_datos_usuario(
+            self.reg_nombre.get().strip(), self.reg_usuario.get().strip(), self.reg_correo.get().strip(),
+            self.reg_telefono.get().strip(), self.reg_pass1.get(), self.reg_pass2.get())
+        if errores:
+            messagebox.showerror("Errores de Validación ❌", "\n".join(errores))
             return
+        SeguridadService.mostrar_modal_politica_datos(self, self.guardar_registro)
 
-        for widget in self.body_scroll.winfo_children():
-            widget.destroy()
-
-        ctk.CTkLabel(self.body_scroll, text="📜 HISTORIAL DE AUDITORÍA", font=("Calibri", 26, "bold"), text_color=("#111827", "#F9FAFB")).pack(pady=(15, 2))
-        ctk.CTkLabel(self.body_scroll, text="Registro detallado de accesos y operaciones realizadas en el taller", font=("Calibri", 16), text_color=("#4B5563", "#9CA3AF")).pack(pady=(0, 15))
-
-        frame_tabla_logs = ctk.CTkFrame(self.body_scroll, fg_color="transparent")
-        frame_tabla_logs.pack(fill="both", expand=True, padx=20, pady=10)
+    def guardar_registro(self):
+        nombre = self.reg_nombre.get().strip()
+        usuario = self.reg_usuario.get().strip()
+        correo = self.reg_correo.get().strip()
+        telefono = self.reg_telefono.get().strip()
+        pass_hash = SeguridadService.hashear(self.reg_pass1.get())
 
         try:
-            conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-            cursor = conexion.cursor(dictionary=True)
-            cursor.execute("SELECT id_log, usuario, rol, accion, fecha_registro FROM logs_sistema ORDER BY fecha_registro DESC LIMIT 100")
-            logs = cursor.fetchall()
-
-            if not logs:
-                ctk.CTkLabel(frame_tabla_logs, text="No hay registros de auditoría en el sistema aún.", font=("Calibri", 16), text_color=("#6B7280", "#9CA3AF")).pack(pady=30)
-            else:
-                for log in logs:
-                    card_l = ctk.CTkFrame(frame_tabla_logs, fg_color=("#FFFFFF", "#1E1E22"), corner_radius=12, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
-                    card_l.pack(fill="x", pady=6, ipadx=14, ipady=10)
-
-                    top_l = ctk.CTkFrame(card_l, fg_color="transparent")
-                    top_l.pack(fill="x")
-
-                    ctk.CTkLabel(top_l, text=f"👤 {log['usuario']} ({log['rol']})", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFFFFF")).pack(side="left")
-                    ctk.CTkLabel(top_l, text=f"🕒 {log['fecha_registro']}", font=("Calibri", 14, "bold"), text_color=("#6B7280", "#9CA3AF")).pack(side="right")
-
-                    ctk.CTkLabel(card_l, text=f"• {log['accion']}", font=("Calibri", 15), text_color=("#374151", "#E5E7EB"), anchor="w").pack(fill="x", pady=(4, 0))
-
-            cursor.close()
-            conexion.close()
-
+            with conexion_db() as (con, cur):
+                cur.execute(
+                    "INSERT INTO usuarios (nombre_completo, usuario, correo, telefono, password_hash, rol, estado) "
+                    "VALUES (%s, %s, %s, %s, %s, 'Cliente', 'Activo')",
+                    (nombre, usuario, correo, telefono, pass_hash))
+                con.commit()
+            self.registrar_log("Nuevo cliente registrado (aceptó política de datos)", usuario=usuario, rol="Cliente")
+            messagebox.showinfo("Registro Exitoso 🎉", f"¡Cuenta creada correctamente!\nInicie sesión con el usuario: {usuario}")
+            self.mostrar_login()
+        except mysql.connector.IntegrityError:
+            messagebox.showerror("Usuario no disponible ❌", "Ese nombre de usuario ya está en uso. Elija otro.")
         except mysql.connector.Error as err:
-            ctk.CTkLabel(frame_tabla_logs, text=f"Error cargando auditoría:\n{err}", text_color="#D32F2F").pack(pady=20)
+            messagebox.showerror("Error ❌", f"Error:\n{err}")
+
+    # =========================================================================
+    # AUDITORÍA Y USUARIOS
+    # =========================================================================
+    def mostrar_historial_logs(self):
+        if not self.tiene_rol("administrador"):
+            return
+        self.seleccionar_opcion_menu("logs")
+        if not self.body_scroll:
+            return
+        for w in self.body_scroll.winfo_children():
+            w.destroy()
+
+        self._encabezado_body("📜 HISTORIAL DE AUDITORÍA", "Registro detallado de accesos y operaciones realizadas en el taller")
+        frame = ctk.CTkFrame(self.body_scroll, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+        try:
+            with conexion_db(True) as (con, cur):
+                cur.execute("SELECT id_log, usuario, rol, accion, fecha_registro FROM logs_sistema ORDER BY fecha_registro DESC LIMIT 100")
+                logs = cur.fetchall()
+        except mysql.connector.Error as err:
+            ctk.CTkLabel(frame, text=f"Error cargando auditoría:\n{err}", text_color=ROJO).pack(pady=20)
+            return
+
+        if not logs:
+            ctk.CTkLabel(frame, text="No hay registros de auditoría en el sistema aún.", font=("Calibri", 16),
+                         text_color=("#6B7280", "#9CA3AF")).pack(pady=30)
+            return
+        for log in logs:
+            card = ctk.CTkFrame(frame, fg_color=CARD_BG, corner_radius=12, border_width=1, border_color=CARD_BORDE)
+            card.pack(fill="x", pady=6, ipadx=14, ipady=10)
+            top = ctk.CTkFrame(card, fg_color="transparent")
+            top.pack(fill="x")
+            ctk.CTkLabel(top, text=f"👤 {log['usuario']} ({log['rol']})", font=("Calibri", 16, "bold"), text_color=TXT_T).pack(side="left")
+            ctk.CTkLabel(top, text=f"🕒 {log['fecha_registro']}", font=("Calibri", 14, "bold"), text_color=("#6B7280", "#9CA3AF")).pack(side="right")
+            ctk.CTkLabel(card, text=f"• {log['accion']}", font=("Calibri", 15), text_color=("#374151", "#E5E7EB"), anchor="w").pack(fill="x", pady=(4, 0))
 
     def alternar_estado_usuario(self, id_usuario, estado_actual):
-        nuevo_estado = "Inactivo" if estado_actual == "Activo" else "Activo"
-        accion_txt = "desactivar" if nuevo_estado == "Inactivo" else "reactivar"
-
-        if messagebox.askyesno("Confirmar Cambio ⚠️", f"¿Desea {accion_txt} la cuenta del usuario #{id_usuario}?"):
-            try:
-                conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-                cursor = conexion.cursor()
-                cursor.execute("UPDATE usuarios SET estado = %s WHERE id_usuario = %s", (nuevo_estado, id_usuario))
-                conexion.commit()
-
-                self.registrar_log(f"Cambió el estado del usuario #{id_usuario} a {nuevo_estado}")
-                messagebox.showinfo("Éxito 🎉", f"El usuario ahora se encuentra '{nuevo_estado}'.")
-                cursor.close()
-                conexion.close()
-
-                self.mostrar_lista_usuarios()
-            except mysql.connector.Error as err:
-                messagebox.showerror("Error BD ❌", str(err))
+        if not self.tiene_rol("administrador"):
+            return
+        if id_usuario == self.id_usuario_actual:
+            messagebox.showwarning("Acción no permitida ⚠️", "No puede desactivar su propia cuenta.")
+            return
+        nuevo = "Inactivo" if estado_actual == "Activo" else "Activo"
+        accion = "desactivar" if nuevo == "Inactivo" else "reactivar"
+        if not messagebox.askyesno("Confirmar Cambio ⚠️", f"¿Desea {accion} la cuenta del usuario #{id_usuario}?"):
+            return
+        try:
+            with conexion_db() as (con, cur):
+                cur.execute("UPDATE usuarios SET estado = %s WHERE id_usuario = %s", (nuevo, id_usuario))
+                con.commit()
+            self.registrar_log(f"Cambió el estado del usuario #{id_usuario} a {nuevo}")
+            messagebox.showinfo("Éxito 🎉", f"El usuario ahora se encuentra '{nuevo}'.")
+            self.mostrar_lista_usuarios()
+        except mysql.connector.Error as err:
+            messagebox.showerror("Error ❌", str(err))
 
     def abrir_registro_integrado_por_rol(self, rol_objetivo):
-        for widget in self.body_scroll.winfo_children():
-            widget.destroy()
+        if not self.tiene_rol("administrador"):
+            return
+        if rol_objetivo not in ("Administrador", "Mecánico", "Cliente"):
+            return
+        for w in self.body_scroll.winfo_children():
+            w.destroy()
 
-        ctk.CTkLabel(self.body_scroll, text=f"👤 REGISTRAR {rol_objetivo.upper()}", font=("Calibri", 26, "bold"), text_color=("#111827", "#F9FAFB")).pack(pady=(15, 2))
-        ctk.CTkLabel(self.body_scroll, text=f"Ingrese la información para dar de alta un nuevo usuario con rol de {rol_objetivo}", font=("Calibri", 16), text_color=("#4B5563", "#9CA3AF")).pack(pady=(0, 20))
+        self._encabezado_body(f"👤 REGISTRAR {rol_objetivo.upper()}", f"Ingrese la información para dar de alta un nuevo usuario con rol de {rol_objetivo}")
+        card = ctk.CTkFrame(self.body_scroll, fg_color=CARD_BG, corner_radius=16, border_width=1, border_color=CARD_BORDE)
+        card.pack(padx=40, pady=10, fill="x")
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(padx=30, pady=25, fill="x")
 
-        card_form = ctk.CTkFrame(self.body_scroll, fg_color=("#FFFFFF", "#1E1E22"), corner_radius=16, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
-        card_form.pack(padx=40, pady=10, fill="x")
+        txt_nom = self._campo(inner, "Nombre completo:", alto=44)
+        txt_usr = self._campo(inner, "Usuario de acceso:", alto=44)
+        txt_cor = self._campo(inner, "Correo electrónico:", alto=44)
+        txt_tel = self._campo(inner, "Teléfono de contacto (10 dígitos):", alto=44)
+        txt_pas = self._campo(inner, "Contraseña inicial (mín. 8, letras y números):", show="•", alto=44)
 
-        form_inner = ctk.CTkFrame(card_form, fg_color="transparent")
-        form_inner.pack(padx=30, pady=25, fill="x")
+        barra = ctk.CTkFrame(inner, fg_color="transparent")
+        barra.pack(fill="x", pady=(15, 0))
 
-        ctk.CTkLabel(form_inner, text="Nombre completo:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_nom = ctk.CTkEntry(form_inner, height=44, font=("Calibri", 16))
-        txt_nom.pack(fill="x", pady=(2, 12))
-
-        ctk.CTkLabel(form_inner, text="Usuario de acceso:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_usr = ctk.CTkEntry(form_inner, height=44, font=("Calibri", 16))
-        txt_usr.pack(fill="x", pady=(2, 12))
-
-        ctk.CTkLabel(form_inner, text="Correo electrónico:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_cor = ctk.CTkEntry(form_inner, height=44, font=("Calibri", 16))
-        txt_cor.pack(fill="x", pady=(2, 12))
-
-        ctk.CTkLabel(form_inner, text="Teléfono de contacto:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_tel = ctk.CTkEntry(form_inner, height=44, font=("Calibri", 16))
-        txt_tel.pack(fill="x", pady=(2, 12))
-
-        ctk.CTkLabel(form_inner, text="Contraseña inicial:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_pas = ctk.CTkEntry(form_inner, height=44, show="•", font=("Calibri", 16))
-        txt_pas.pack(fill="x", pady=(2, 25))
-
-        btn_bar = ctk.CTkFrame(form_inner, fg_color="transparent")
-        btn_bar.pack(fill="x")
-
-        def volver_a_pestaña():
+        def volver():
             if rol_objetivo == "Mecánico":
                 self.mostrar_lista_usuarios("Mecánicos", "Mecánico")
             elif rol_objetivo == "Administrador":
@@ -565,399 +956,276 @@ class AppTallerAutomotriz(ctk.CTk):
             else:
                 self.mostrar_lista_usuarios("Clientes", "Cliente")
 
-        ctk.CTkButton(
-            btn_bar, text="⬅️ Cancelar y Volver", width=180, height=46,
-            fg_color=("#E5E7EB", "#2A2D34"), hover_color=("#D1D5DB", "#374151"),
-            text_color=("#111827", "#FFF"), font=("Calibri", 15, "bold"),
-            command=volver_a_pestaña
-        ).pack(side="left")
+        ctk.CTkButton(barra, text="⬅️ Cancelar y Volver", width=180, height=46, fg_color=BTN_GRIS, hover_color=BTN_GRIS_H,
+                      text_color=TXT_T, font=("Calibri", 15, "bold"), command=volver).pack(side="left")
 
         def guardar():
-            n, u, c, t, p = txt_nom.get().strip(), txt_usr.get().strip(), txt_cor.get().strip(), txt_tel.get().strip(), txt_pas.get().strip()
-            if not n or not u or not c or not t or not p:
-                messagebox.showwarning("Atención ⚠️", "Por favor complete todos los campos requeridos.")
+            n, u, c, t, p = txt_nom.get().strip(), txt_usr.get().strip(), txt_cor.get().strip(), txt_tel.get().strip(), txt_pas.get()
+            errores = self.validar_datos_usuario(n, u, c, t, p)
+            if errores:
+                messagebox.showwarning("Errores de Validación ⚠️", "\n".join(errores))
                 return
             try:
-                ph = hashlib.sha256(p.encode()).hexdigest()
-                conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-                cursor = conexion.cursor()
-                cursor.execute("INSERT INTO usuarios (nombre_completo, usuario, correo, telefono, password_hash, rol, estado) VALUES (%s, %s, %s, %s, %s, %s, 'Activo')", (n, u, c, t, ph, rol_objetivo))
-                conexion.commit()
+                with conexion_db() as (con, cur):
+                    cur.execute(
+                        "INSERT INTO usuarios (nombre_completo, usuario, correo, telefono, password_hash, rol, estado) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, 'Activo')",
+                        (n, u, c, t, SeguridadService.hashear(p), rol_objetivo))
+                    con.commit()
                 self.registrar_log(f"Creó la cuenta de {rol_objetivo} '{n}'")
                 messagebox.showinfo("Registro Completado 🎉", f"Cuenta de {rol_objetivo} creada exitosamente.")
-                cursor.close()
-                conexion.close()
-                volver_a_pestaña()
+                volver()
+            except mysql.connector.IntegrityError:
+                messagebox.showerror("Usuario no disponible ❌", "Ese nombre de usuario ya está en uso.")
             except mysql.connector.Error as err:
-                messagebox.showerror("Error BD ❌", str(err))
+                messagebox.showerror("Error ❌", str(err))
 
-        ctk.CTkButton(
-            btn_bar, text=f"💾 Guardar {rol_objetivo}", width=220, height=46,
-            fg_color="#D32F2F", hover_color="#B71C1C", font=("Calibri", 16, "bold"),
-            command=guardar
-        ).pack(side="right")
+        ctk.CTkButton(barra, text=f"💾 Guardar {rol_objetivo}", width=220, height=46, fg_color=ROJO, hover_color=ROJO_H,
+                      font=("Calibri", 16, "bold"), command=guardar).pack(side="right")
 
     def cargar_cards_usuarios(self, contenedor, filtro_rol=None):
         for w in contenedor.winfo_children():
             w.destroy()
-
         try:
-            conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-            cursor = conexion.cursor(dictionary=True)
-            
-            if filtro_rol and filtro_rol != "Todos":
-                cursor.execute("SELECT id_usuario, nombre_completo, usuario, correo, telefono, rol, estado FROM usuarios WHERE LOWER(rol) LIKE %s ORDER BY id_usuario ASC", (f"%{filtro_rol.lower()}%",))
-            else:
-                cursor.execute("SELECT id_usuario, nombre_completo, usuario, correo, telefono, rol, estado FROM usuarios ORDER BY id_usuario ASC")
-            
-            usuarios = cursor.fetchall()
-
-            if not usuarios:
-                ctk.CTkLabel(contenedor, text="No hay usuarios registrados en esta sección.", font=("Calibri", 16), text_color=("#6B7280", "#9CA3AF")).pack(pady=30)
-            else:
-                for u in usuarios:
-                    rol = str(u['rol']).strip().capitalize()
-                    estado = u['estado']
-
-                    card_usr = ctk.CTkFrame(contenedor, fg_color=("#FFFFFF", "#1E1E22"), corner_radius=12, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
-                    card_usr.pack(fill="x", pady=6, ipadx=14, ipady=10)
-
-                    top_card = ctk.CTkFrame(card_usr, fg_color="transparent")
-                    top_card.pack(fill="x")
-
-                    ctk.CTkLabel(top_card, text=f"#{u['id_usuario']} {u['nombre_completo']}", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(side="left")
-
-                    badge_rol = ctk.CTkLabel(top_card, text=f"  {rol}  ", font=("Calibri", 13, "bold"), fg_color="#FFF0F0" if rol=="Administrador" else "#2D2D35", text_color="#D32F2F" if rol=="Administrador" else "#EEE", corner_radius=6)
-                    badge_rol.pack(side="left", padx=10)
-
-                    bg_est = "#E8F5E9" if estado == "Activo" else "#FFEBEE"
-                    tx_est = "#2E7D32" if estado == "Activo" else "#C62828"
-                    badge_est = ctk.CTkLabel(top_card, text=f"● {estado}", font=("Calibri", 13, "bold"), fg_color=bg_est, text_color=tx_est, corner_radius=6)
-                    badge_est.pack(side="right")
-
-                    info_txt = f"Usuario: {u['usuario']} | Tel: {u['telefono']} | {u['correo'] if u['correo'] else 'Sin correo'}"
-                    ctk.CTkLabel(card_usr, text=info_txt, font=("Calibri", 14), text_color=("#4B5563", "#9CA3AF"), anchor="w").pack(fill="x", pady=(4, 6))
-
-                    btn_txt = "🚫 Desactivar" if estado == "Activo" else "✅ Reactivar"
-                    btn_color = "#C62828" if estado == "Activo" else "#2E7D32"
-                    btn_hover = "#9A0007" if estado == "Activo" else "#1B5E20"
-
-                    ctk.CTkButton(
-                        card_usr, text=btn_txt, width=120, height=32, 
-                        fg_color=btn_color, hover_color=btn_hover, 
-                        font=("Calibri", 13, "bold"),
-                        command=lambda uid=u['id_usuario'], est=estado: self.alternar_estado_usuario(uid, est)
-                    ).pack(anchor="e")
-
-            cursor.close()
-            conexion.close()
-
+            with conexion_db(True) as (con, cur):
+                base = "SELECT id_usuario, nombre_completo, usuario, correo, telefono, rol, estado FROM usuarios"
+                if filtro_rol and filtro_rol != "Todos":
+                    cur.execute(base + " WHERE LOWER(rol) LIKE %s ORDER BY id_usuario ASC", (f"%{filtro_rol.lower()}%",))
+                else:
+                    cur.execute(base + " ORDER BY id_usuario ASC")
+                usuarios = cur.fetchall()
         except mysql.connector.Error as err:
-            ctk.CTkLabel(contenedor, text=f"Error al cargar usuarios:\n{err}", text_color="#D32F2F").pack(pady=20)
-
-    def mostrar_lista_usuarios(self, pestaña_inicial="Todos", filtro_inicial="Todos"):
-        self.seleccionar_opcion_menu("usuarios")
-
-        if not hasattr(self, 'body_scroll') or not self.body_scroll:
+            ctk.CTkLabel(contenedor, text=f"Error al cargar usuarios:\n{err}", text_color=ROJO).pack(pady=20)
             return
 
-        for widget in self.body_scroll.winfo_children():
-            widget.destroy()
+        if not usuarios:
+            ctk.CTkLabel(contenedor, text="No hay usuarios registrados en esta sección.", font=("Calibri", 16),
+                         text_color=("#6B7280", "#9CA3AF")).pack(pady=30)
+            return
 
-        ctk.CTkLabel(self.body_scroll, text="👥 GESTIÓN DE USUARIOS", font=("Calibri", 26, "bold"), text_color=("#111827", "#F9FAFB")).pack(pady=(15, 2))
-        ctk.CTkLabel(self.body_scroll, text="Administración por roles y filtrado rápido del personal", font=("Calibri", 16), text_color=("#4B5563", "#9CA3AF")).pack(pady=(0, 15))
+        for u in usuarios:
+            rol = str(u['rol']).strip().capitalize()
+            estado = u['estado']
+            card = ctk.CTkFrame(contenedor, fg_color=CARD_BG, corner_radius=12, border_width=1, border_color=CARD_BORDE)
+            card.pack(fill="x", pady=6, ipadx=14, ipady=10)
+            top = ctk.CTkFrame(card, fg_color="transparent")
+            top.pack(fill="x")
 
+            ctk.CTkLabel(top, text=f"#{u['id_usuario']} {u['nombre_completo']}", font=("Calibri", 16, "bold"), text_color=TXT_T).pack(side="left")
+            es_admin = rol == "Administrador"
+            ctk.CTkLabel(top, text=f"  {rol}  ", font=("Calibri", 13, "bold"), fg_color="#FFF0F0" if es_admin else "#2D2D35",
+                         text_color=ROJO if es_admin else "#EEE", corner_radius=6).pack(side="left", padx=10)
+            bg, tx = ("#E8F5E9", "#2E7D32") if estado == "Activo" else ("#FFEBEE", "#C62828")
+            ctk.CTkLabel(top, text=f"● {estado}", font=("Calibri", 13, "bold"), fg_color=bg, text_color=tx, corner_radius=6).pack(side="right")
+
+            info = f"Usuario: {u['usuario']} | Tel: {u['telefono']} | {u['correo'] if u['correo'] else 'Sin correo'}"
+            ctk.CTkLabel(card, text=info, font=("Calibri", 14), text_color=TXT_S, anchor="w").pack(fill="x", pady=(4, 6))
+
+            activo = estado == "Activo"
+            ctk.CTkButton(card, text="🚫 Desactivar" if activo else "✅ Reactivar", width=120, height=32,
+                          fg_color="#C62828" if activo else "#2E7D32", hover_color="#9A0007" if activo else "#1B5E20",
+                          font=("Calibri", 13, "bold"),
+                          command=lambda uid=u['id_usuario'], est=estado: self.alternar_estado_usuario(uid, est)).pack(anchor="e")
+
+    def mostrar_lista_usuarios(self, pestaña_inicial="Todos", filtro_inicial="Todos"):
+        if not self.tiene_rol("administrador"):
+            return
+        self.seleccionar_opcion_menu("usuarios")
+        if not self.body_scroll:
+            return
+        for w in self.body_scroll.winfo_children():
+            w.destroy()
+
+        self._encabezado_body("👥 GESTIÓN DE USUARIOS", "Administración por roles y filtrado rápido del personal")
         bar_tabs = ctk.CTkFrame(self.body_scroll, fg_color="transparent")
         bar_tabs.pack(fill="x", padx=10, pady=(0, 10))
-
         tabs_buttons = ctk.CTkFrame(bar_tabs, fg_color="transparent")
         tabs_buttons.pack(side="left")
-
         container_list = ctk.CTkFrame(self.body_scroll, fg_color="transparent")
         container_list.pack(fill="both", expand=True, padx=10)
 
         self.btn_tabs_dict = {}
-
+        self.btn_registrar_container = None
         pestañas = [("Todos", "Todos"), ("Administrador", "Administrador"), ("Mecánicos", "Mecánico"), ("Clientes", "Cliente")]
 
         def seleccionar_tab(nombre_tab, rol_filtro):
             for name, b in self.btn_tabs_dict.items():
                 if name == nombre_tab:
-                    b.configure(fg_color="#D32F2F", text_color="#FFFFFF", hover_color="#B71C1C")
+                    b.configure(fg_color=ROJO, text_color="#FFFFFF", hover_color=ROJO_H)
                 else:
-                    b.configure(
-                        fg_color=("#E5E7EB", "#2A2D34"),
-                        text_color=("#111827", "#E0E0E0"),
-                        hover_color=("#D1D5DB", "#374151")
-                    )
-
-            if hasattr(self, 'btn_registrar_container') and self.btn_registrar_container:
+                    b.configure(fg_color=BTN_GRIS, text_color=("#111827", "#E0E0E0"), hover_color=BTN_GRIS_H)
+            if self.btn_registrar_container:
                 self.btn_registrar_container.destroy()
-
             self.btn_registrar_container = ctk.CTkFrame(bar_tabs, fg_color="transparent")
             self.btn_registrar_container.pack(side="right")
-
             if rol_filtro and rol_filtro != "Todos":
-                btn_add = ctk.CTkButton(
-                    self.btn_registrar_container, text=f"➕ Registrar {rol_filtro}", height=38,
-                    fg_color="#D32F2F", hover_color="#B71C1C", font=("Calibri", 15, "bold"),
-                    command=lambda r=rol_filtro: self.abrir_registro_integrado_por_rol(r)
-                )
-                btn_add.pack()
-
+                ctk.CTkButton(self.btn_registrar_container, text=f"➕ Registrar {rol_filtro}", height=38, fg_color=ROJO,
+                              hover_color=ROJO_H, font=("Calibri", 15, "bold"),
+                              command=lambda r=rol_filtro: self.abrir_registro_integrado_por_rol(r)).pack()
             self.cargar_cards_usuarios(container_list, rol_filtro)
 
         for nombre_tab, rol_filtro in pestañas:
-            btn_t = ctk.CTkButton(
-                tabs_buttons, text=nombre_tab, width=120, height=38, corner_radius=20,
-                font=("Calibri", 15, "bold"),
-                command=lambda n=nombre_tab, r=rol_filtro: seleccionar_tab(n, r)
-            )
-            btn_t.pack(side="left", padx=4)
-            self.btn_tabs_dict[nombre_tab] = btn_t
+            b = ctk.CTkButton(tabs_buttons, text=nombre_tab, width=120, height=38, corner_radius=20, font=("Calibri", 15, "bold"),
+                              command=lambda n=nombre_tab, r=rol_filtro: seleccionar_tab(n, r))
+            b.pack(side="left", padx=4)
+            self.btn_tabs_dict[nombre_tab] = b
 
         seleccionar_tab(pestaña_inicial, filtro_inicial)
 
     # =========================================================================
-    # FORMULARIO UNIVERSAL DE VEHÍCULO
+    # VEHÍCULOS
     # =========================================================================
     def abrir_registro_vehiculo(self):
-        self.seleccionar_opcion_menu("vehiculos")
-
-        if not hasattr(self, 'body_scroll') or not self.body_scroll:
+        if not self.tiene_rol("administrador", "mecanico", "cliente"):
             return
+        es_cliente = normalizar_rol(self.rol_actual) == "cliente"
+        titulo = "🚘 Registrar Mi Vehículo" if es_cliente else "🚘 Registro de Vehículo"
+        win, cuerpo = self.crear_ventana_flotante(titulo, 480, 470 if es_cliente else 545)
 
-        for widget in self.body_scroll.winfo_children():
-            widget.destroy()
+        txt_placa = self._campo(cuerpo, "Placa del Vehículo (requerida):", "Ej. ABC123")
+        txt_marca = self._campo(cuerpo, "Marca:", "Ej. Chevrolet, Toyota, Mazda")
+        txt_color = self._campo(cuerpo, "Color:", "Ej. Rojo, Negro, Blanco")
+        txt_modelo = self._campo(cuerpo, "Modelo / Año:", "Ej. 2020")
 
-        rol_normalizado = str(self.rol_actual).strip().capitalize()
-        titulo_pantalla = "🚘 REGISTRAR MI VEHÍCULO" if rol_normalizado == "Cliente" else "🚘 REGISTRO DE VEHÍCULO"
-
-        ctk.CTkLabel(self.body_scroll, text=titulo_pantalla, font=("Calibri", 26, "bold"), text_color=("#111827", "#F9FAFB")).pack(pady=(15, 2))
-        ctk.CTkLabel(self.body_scroll, text="Ingrese los datos oficiales del automóvil para guardarlo en la base de datos", font=("Calibri", 16), text_color=("#4B5563", "#9CA3AF")).pack(pady=(0, 20))
-
-        card_form = ctk.CTkFrame(self.body_scroll, fg_color=("#FFFFFF", "#1E1E22"), corner_radius=16, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
-        card_form.pack(padx=40, pady=10, fill="x")
-
-        form_inner = ctk.CTkFrame(card_form, fg_color="transparent")
-        form_inner.pack(padx=30, pady=25, fill="x")
-
-        # PLACA
-        ctk.CTkLabel(form_inner, text="Placa del Vehículo (Requerido):", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_v_placa = ctk.CTkEntry(form_inner, height=44, placeholder_text="Ej. ABC123", font=("Calibri", 16))
-        txt_v_placa.pack(fill="x", pady=(2, 12))
-
-        # MARCA
-        ctk.CTkLabel(form_inner, text="Marca:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_v_marca = ctk.CTkEntry(form_inner, height=44, placeholder_text="Ej. Chevrolet, Toyota, Mazda", font=("Calibri", 16))
-        txt_v_marca.pack(fill="x", pady=(2, 12))
-
-        # COLOR
-        ctk.CTkLabel(form_inner, text="Color:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_v_color = ctk.CTkEntry(form_inner, height=44, placeholder_text="Ej. Rojo, Negro, Blanco", font=("Calibri", 16))
-        txt_v_color.pack(fill="x", pady=(2, 12))
-
-        # MODELO
-        ctk.CTkLabel(form_inner, text="Modelo / Año (modelo INT):", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_v_modelo = ctk.CTkEntry(form_inner, height=44, placeholder_text="Ej. 2020", font=("Calibri", 16))
-        txt_v_modelo.pack(fill="x", pady=(2, 12))
-
-        # DESPLEGABLE SOLO PARA ADMIN Y MECÁNICO
-        combo_cliente = None
-        dict_clientes = {}
-        if rol_normalizado != "Cliente":
+        combo, dict_clientes = None, {}
+        if not es_cliente:
             dict_clientes = self.obtener_lista_clientes()
-            opciones_combo = list(dict_clientes.keys())
-            ctk.CTkLabel(form_inner, text="Propietario / Cliente del Vehículo:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-            combo_cliente = ctk.CTkComboBox(form_inner, height=44, values=opciones_combo, font=("Calibri", 16), state="readonly")
-            combo_cliente.set(opciones_combo[0] if opciones_combo else "Sin asignar")
-            combo_cliente.pack(fill="x", pady=(2, 12))
+            opciones = list(dict_clientes.keys())
+            ctk.CTkLabel(cuerpo, text="Propietario / Cliente:", font=("Calibri", 15, "bold"), text_color=("#111827", "#FFFFFF")).pack(anchor="w")
+            combo = ctk.CTkComboBox(cuerpo, height=38, values=opciones, font=("Calibri", 15), state="readonly")
+            combo.set(opciones[0] if opciones else "Sin asignar")
+            combo.pack(fill="x", pady=(2, 10))
 
-        btn_bar = ctk.CTkFrame(form_inner, fg_color="transparent")
-        btn_bar.pack(fill="x", pady=(15, 0))
+        def guardar():
+            placa = txt_placa.get().strip().upper()
+            marca, color, mod = txt_marca.get().strip(), txt_color.get().strip(), txt_modelo.get().strip()
 
-        ctk.CTkButton(
-            btn_bar, text="⬅️ Cancelar y Volver", width=180, height=46,
-            fg_color=("#E5E7EB", "#2A2D34"), hover_color=("#D1D5DB", "#374151"),
-            text_color=("#111827", "#FFF"), font=("Calibri", 15, "bold"),
-            command=lambda: self.mostrar_inicio_dashboard(rol_normalizado)
-        ).pack(side="left")
-
-        def guardar_vehiculo_bd():
-            p = txt_v_placa.get().strip().upper()
-            marca = txt_v_marca.get().strip()
-            c = txt_v_color.get().strip()
-            mod_str = txt_v_modelo.get().strip()
-
-            if not p or not marca:
-                messagebox.showwarning("Campos Incompletos ⚠️", "La Placa y la Marca son obligatorias.")
+            if not re.fullmatch(r"[A-Z0-9]{5,7}", placa):
+                messagebox.showwarning("Placa inválida ⚠️", "La placa debe tener entre 5 y 7 letras o números (Ej. ABC123).", parent=win)
                 return
+            if not marca:
+                messagebox.showwarning("Campos Incompletos ⚠️", "La marca es obligatoria.", parent=win)
+                return
+            modelo = None
+            if mod:
+                if not (mod.isdigit() and 1950 <= int(mod) <= datetime.now().year + 1):
+                    messagebox.showwarning("Año inválido ⚠️", "Ingrese un año válido (Ej. 2020).", parent=win)
+                    return
+                modelo = int(mod)
 
-            modelo_val = int(mod_str) if mod_str.isdigit() else None
-
-            if rol_normalizado == "Cliente":
-                id_cliente_val = self.id_usuario_actual
-            else:
-                cliente_sel = combo_cliente.get() if combo_cliente else "Sin asignar"
-                id_cliente_val = dict_clientes.get(cliente_sel, None)
-
+            id_cliente = self.id_usuario_actual if es_cliente else dict_clientes.get(combo.get() if combo else "Sin asignar")
             try:
-                conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-                cursor = conexion.cursor()
-
-                sql = "INSERT INTO vehiculos (id_cliente, placa, marca, color, modelo) VALUES (%s, %s, %s, %s, %s)"
-                cursor.execute(sql, (id_cliente_val, p, marca, c if c else None, modelo_val))
-                conexion.commit()
-
-                cursor.close()
-                conexion.close()
-
-                self.registrar_log(f"Registró en BD el vehículo placa {p} ({marca})")
-                messagebox.showinfo("¡Vehículo Registrado! 🚗", f"El automóvil fue guardado exitosamente en la base de datos.\n\nPlaca: {p}\nMarca: {marca}\nColor: {c if c else 'N/A'}\nModelo: {modelo_val if modelo_val else 'N/A'}")
-                self.mostrar_inicio_dashboard(rol_normalizado)
-
+                with conexion_db() as (con, cur):
+                    cur.execute("INSERT INTO vehiculos (id_cliente, placa, marca, color, modelo) VALUES (%s, %s, %s, %s, %s)",
+                                (id_cliente, placa, marca, color or None, modelo))
+                    con.commit()
+                self.registrar_log(f"Registró el vehículo placa {placa} ({marca})")
+                messagebox.showinfo("¡Vehículo Registrado! 🚗", f"Placa: {placa}\nMarca: {marca}\nColor: {color or 'N/A'}\nModelo: {modelo or 'N/A'}", parent=win)
+                win.destroy()
+            except mysql.connector.IntegrityError:
+                messagebox.showerror("Placa duplicada ❌", "Esa placa ya está registrada en el sistema.", parent=win)
             except mysql.connector.Error as err:
-                messagebox.showerror("Error BD ❌", f"No se pudo registrar el vehículo en la base de datos:\n\n{err}")
+                messagebox.showerror("Error ❌", f"No se pudo registrar el vehículo:\n\n{err}", parent=win)
 
-        ctk.CTkButton(
-            btn_bar, text="💾 Registrar Vehículo", width=240, height=46,
-            fg_color="#D32F2F", hover_color="#B71C1C", font=("Calibri", 16, "bold"),
-            command=guardar_vehiculo_bd
-        ).pack(side="right")
+        self._barra_botones(cuerpo, "💾 Registrar Vehículo", guardar, win)
 
-    # =========================================================================
-    # BÚSQUEDA Y REGISTRO DE TRABAJOS / HISTORIAL DE MANTENIMIENTO EN TABLA
-    # =========================================================================
     def abrir_formulario_mantenimiento_embebido(self, id_vehiculo, placa):
-        for widget in self.body_scroll.winfo_children():
-            widget.destroy()
+        if not self.tiene_rol("administrador", "mecanico"):
+            return
+        win, cuerpo = self.crear_ventana_flotante(f"🛠 Registrar Trabajo ({placa})", 480, 600)
 
-        ctk.CTkLabel(self.body_scroll, text=f"🛠️ REGISTRAR TRABAJO ({placa})", font=("Calibri", 26, "bold"), text_color=("#111827", "#F9FAFB")).pack(pady=(15, 2))
-        ctk.CTkLabel(self.body_scroll, text="Ingrese los detalles del servicio técnico realizado al vehículo", font=("Calibri", 16), text_color=("#4B5563", "#9CA3AF")).pack(pady=(0, 20))
-
-        card_form = ctk.CTkFrame(self.body_scroll, fg_color=("#FFFFFF", "#1E1E22"), corner_radius=16, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
-        card_form.pack(padx=40, pady=10, fill="x")
-
-        form_inner = ctk.CTkFrame(card_form, fg_color="transparent")
-        form_inner.pack(padx=30, pady=25, fill="x")
-
-        # FECHA REALIZADA
-        ctk.CTkLabel(form_inner, text="📅 Fecha en que se realizó el trabajo:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        
-        f_fecha = ctk.CTkFrame(form_inner, fg_color="transparent")
-        f_fecha.pack(fill="x", pady=(4, 15))
+        ctk.CTkLabel(cuerpo, text="📅 Fecha en que se realizó el trabajo:", font=("Calibri", 15, "bold"), text_color=("#111827", "#FFFFFF")).pack(anchor="w")
+        f_fecha = ctk.CTkFrame(cuerpo, fg_color="transparent")
+        f_fecha.pack(fill="x", pady=(2, 10))
 
         hoy = datetime.now()
-        dias = [str(i).zfill(2) for i in range(1, 32)]
-        meses = [str(i).zfill(2) for i in range(1, 13)]
-        anios = [str(i) for i in range(hoy.year - 5, hoy.year + 2)]
-
-        combo_dia = ctk.CTkComboBox(f_fecha, values=dias, width=80, height=40, font=("Calibri", 15), state="readonly")
+        combo_dia = ctk.CTkComboBox(f_fecha, values=[str(i).zfill(2) for i in range(1, 32)], width=80, height=36, state="readonly")
         combo_dia.set(str(hoy.day).zfill(2))
-        combo_dia.pack(side="left", padx=(0, 8))
-
-        ctk.CTkLabel(f_fecha, text="/", font=("Calibri", 18, "bold"), text_color=("#111827", "#FFF")).pack(side="left", padx=(0, 8))
-
-        combo_mes = ctk.CTkComboBox(f_fecha, values=meses, width=80, height=40, font=("Calibri", 15), state="readonly")
+        combo_mes = ctk.CTkComboBox(f_fecha, values=[str(i).zfill(2) for i in range(1, 13)], width=80, height=36, state="readonly")
         combo_mes.set(str(hoy.month).zfill(2))
-        combo_mes.pack(side="left", padx=(0, 8))
-
-        ctk.CTkLabel(f_fecha, text="/", font=("Calibri", 18, "bold"), text_color=("#111827", "#FFF")).pack(side="left", padx=(0, 8))
-
-        combo_anio = ctk.CTkComboBox(f_fecha, values=anios, width=100, height=40, font=("Calibri", 15), state="readonly")
+        combo_anio = ctk.CTkComboBox(f_fecha, values=[str(i) for i in range(hoy.year - 5, hoy.year + 1)], width=100, height=36, state="readonly")
         combo_anio.set(str(hoy.year))
+        combo_dia.pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(f_fecha, text="/").pack(side="left", padx=(0, 6))
+        combo_mes.pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(f_fecha, text="/").pack(side="left", padx=(0, 6))
         combo_anio.pack(side="left")
 
-        # DESCRIPCIÓN DEL TRABAJO
-        ctk.CTkLabel(form_inner, text="📝 Descripción del Trabajo / Mantenimiento:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_desc = ctk.CTkTextbox(form_inner, height=110, font=("Calibri", 15))
-        txt_desc.pack(fill="x", pady=(4, 15))
+        ctk.CTkLabel(cuerpo, text="📝 Descripción del trabajo:", font=("Calibri", 15, "bold"), text_color=("#111827", "#FFFFFF")).pack(anchor="w")
+        txt_desc = ctk.CTkTextbox(cuerpo, height=90, font=("Calibri", 14))
+        txt_desc.pack(fill="x", pady=(2, 10))
 
-        # OBSERVACIONES
-        ctk.CTkLabel(form_inner, text="🔍 Observaciones Adicionales / Diagnóstico:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_obs = ctk.CTkTextbox(form_inner, height=90, font=("Calibri", 15))
-        txt_obs.pack(fill="x", pady=(4, 15))
+        ctk.CTkLabel(cuerpo, text="🔍 Observaciones / Diagnóstico:", font=("Calibri", 15, "bold"), text_color=("#111827", "#FFFFFF")).pack(anchor="w")
+        txt_obs = ctk.CTkTextbox(cuerpo, height=70, font=("Calibri", 14))
+        txt_obs.pack(fill="x", pady=(2, 10))
 
-        # COSTO
-        ctk.CTkLabel(form_inner, text="💰 Costo / Mano de Obra ($ COP):", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_costo = ctk.CTkEntry(form_inner, height=44, placeholder_text="Ej. 150000", font=("Calibri", 16))
-        txt_costo.pack(fill="x", pady=(4, 25))
+        txt_costo = self._campo(cuerpo, "💰 Costo / Mano de obra ($ COP):", "Ej. 150000")
 
-        btn_bar = ctk.CTkFrame(form_inner, fg_color="transparent")
-        btn_bar.pack(fill="x")
-
-        def volver():
-            self.buscar_vehiculo_por_placa(placa_predeterminada=placa)
-
-        ctk.CTkButton(
-            btn_bar, text="⬅️ Cancelar y Volver", width=180, height=46,
-            fg_color=("#E5E7EB", "#2A2D34"), hover_color=("#D1D5DB", "#374151"),
-            text_color=("#111827", "#FFF"), font=("Calibri", 15, "bold"),
-            command=volver
-        ).pack(side="left")
-
-        def guardar_trabajo():
+        def guardar():
             desc = txt_desc.get("1.0", "end").strip()
             obs = txt_obs.get("1.0", "end").strip()
-            c_str = txt_costo.get().strip()
-            fecha_sel = f"{combo_anio.get()}-{combo_mes.get()}-{combo_dia.get()}"
-
             if not desc:
-                messagebox.showwarning("Campo Vacío ⚠️", "Escriba la descripción del trabajo.")
+                messagebox.showwarning("Campo Vacío ⚠️", "Escriba la descripción del trabajo.", parent=win)
                 return
-
-            costo_val = float(c_str) if c_str.replace('.', '', 1).isdigit() else 0.0
-
             try:
-                conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-                cursor = conexion.cursor()
-                
-                sql = "INSERT INTO mantenimientos (id_vehiculo, id_mecanico, descripcion_trabajo, observaciones, costo, fecha_mantenimiento) VALUES (%s, %s, %s, %s, %s, %s)"
-                cursor.execute(sql, (id_vehiculo, self.id_usuario_actual, desc, obs if obs else None, costo_val, fecha_sel))
-                conexion.commit()
-
-                cursor.close()
-                conexion.close()
-
+                fecha = datetime(int(combo_anio.get()), int(combo_mes.get()), int(combo_dia.get()))
+            except ValueError:
+                messagebox.showwarning("Fecha inválida ⚠️", "La fecha seleccionada no existe.", parent=win)
+                return
+            if fecha.date() > datetime.now().date():
+                messagebox.showwarning("Fecha inválida ⚠️", "La fecha no puede ser futura.", parent=win)
+                return
+            try:
+                costo = float(txt_costo.get().strip().replace(",", "") or 0)
+                if costo < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("Costo inválido ⚠️", "Ingrese un costo numérico válido.", parent=win)
+                return
+            try:
+                with conexion_db() as (con, cur):
+                    cur.execute(
+                        "INSERT INTO mantenimientos (id_vehiculo, id_mecanico, descripcion_trabajo, observaciones, costo, fecha_mantenimiento) "
+                        "VALUES (%s, %s, %s, %s, %s, %s)",
+                        (id_vehiculo, self.id_usuario_actual, desc, obs or None, costo, fecha.strftime("%Y-%m-%d")))
+                    con.commit()
                 self.registrar_log(f"Registró trabajo de mantenimiento en vehículo placa {placa}")
-                messagebox.showinfo("¡Trabajo Registrado! 🛠️", "El mantenimiento fue guardado con éxito.")
+                messagebox.showinfo("¡Trabajo Registrado! 🛠️", "El mantenimiento fue guardado con éxito.", parent=win)
+                win.destroy()
                 self.buscar_vehiculo_por_placa(placa_predeterminada=placa)
             except mysql.connector.Error as err:
-                messagebox.showerror("Error BD ❌", f"No se pudo guardar el trabajo:\n\n{err}")
+                messagebox.showerror("Error ❌", f"No se pudo guardar el trabajo:\n\n{err}", parent=win)
 
-        ctk.CTkButton(
-            btn_bar, text="💾 Guardar Mantenimiento", width=240, height=46,
-            fg_color="#D32F2F", hover_color="#B71C1C", font=("Calibri", 16, "bold"),
-            command=guardar_trabajo
-        ).pack(side="right")
+        self._barra_botones(cuerpo, "💾 Guardar Trabajo", guardar, win)
 
+    # =========================================================================
+    # BÚSQUEDA E HISTORIAL
+    # =========================================================================
     def buscar_vehiculo_por_placa(self, placa_predeterminada=None):
-        self.seleccionar_opcion_menu("buscar")
-        if not hasattr(self, 'body_scroll') or not self.body_scroll:
+        if not self.tiene_rol("administrador", "mecanico", "cliente"):
             return
+        self.seleccionar_opcion_menu("buscar")
+        if not self.body_scroll:
+            return
+        for w in self.body_scroll.winfo_children():
+            w.destroy()
 
-        for widget in self.body_scroll.winfo_children():
-            widget.destroy()
+        rol = normalizar_rol(self.rol_actual)
+        self._encabezado_body("🔎 BÚSQUEDA Y HISTORIAL DEL VEHÍCULO", "Consulte los detalles y el historial de trabajos realizados al automóvil")
 
-        ctk.CTkLabel(self.body_scroll, text="🔎 BÚSQUEDA Y HISTORIAL DEL VEHÍCULO", font=("Calibri", 26, "bold"), text_color=("#111827", "#F9FAFB")).pack(pady=(15, 2))
-        ctk.CTkLabel(self.body_scroll, text="Consulte los detalles y el historial de trabajos realizados al automóvil", font=("Calibri", 16), text_color=("#4B5563", "#9CA3AF")).pack(pady=(0, 20))
-
-        card = ctk.CTkFrame(self.body_scroll, fg_color=("#FFFFFF", "#1E1E22"), corner_radius=16, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
+        card = ctk.CTkFrame(self.body_scroll, fg_color=CARD_BG, corner_radius=16, border_width=1, border_color=CARD_BORDE)
         card.pack(padx=40, pady=10, fill="x")
-
         f_inner = ctk.CTkFrame(card, fg_color="transparent")
         f_inner.pack(padx=30, pady=25, fill="x")
 
         ctk.CTkLabel(f_inner, text="Ingrese la Placa a Consultar:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w", pady=(0, 4))
         txt_p = ctk.CTkEntry(f_inner, height=46, placeholder_text="Ej. ABC123", font=("Calibri", 16))
         txt_p.pack(fill="x", pady=(0, 15))
-
         if placa_predeterminada:
             txt_p.insert(0, placa_predeterminada)
 
         res_container = ctk.CTkFrame(f_inner, fg_color="transparent")
         res_container.pack(fill="x", pady=(0, 15))
-
         frame_historial = ctk.CTkFrame(f_inner, fg_color="transparent")
         frame_historial.pack(fill="x")
 
@@ -966,516 +1234,298 @@ class AppTallerAutomotriz(ctk.CTk):
             if not placa:
                 messagebox.showwarning("Atención ⚠️", "Ingrese una placa válida.")
                 return
-
             for w in res_container.winfo_children():
                 w.destroy()
-
             for w in frame_historial.winfo_children():
                 w.destroy()
 
             try:
-                conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-                cursor = conexion.cursor(dictionary=True)
-                cursor.execute("""
-                    SELECT v.*, u.nombre_completo AS propietario, u.telefono AS tel_propietario 
-                    FROM vehiculos v 
-                    LEFT JOIN usuarios u ON v.id_cliente = u.id_usuario 
-                    WHERE v.placa = %s
-                """, (placa,))
-                v = cursor.fetchone()
-
-                if v:
-                    prop = v['propietario'] if v['propietario'] else "Sin asignación directa"
-                    tel_prop = v['tel_propietario'] if v['tel_propietario'] else "N/A"
-                    color_txt = v['color'] if v['color'] else "N/A"
-                    mod_txt = v['modelo'] if v['modelo'] else "N/A"
-
-                    info_box = ctk.CTkFrame(res_container, fg_color=("#F3F4F6", "#141418"), corner_radius=12, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
-                    info_box.pack(fill="x", ipadx=10, ipady=10)
-
-                    f1 = ctk.CTkFrame(info_box, fg_color="transparent")
-                    f1.pack(fill="x", pady=4, padx=10)
-
-                    def crear_item_badge(parent, icono, titulo, valor):
-                        item = ctk.CTkFrame(parent, fg_color=("#FFFFFF", "#1E1E22"), corner_radius=8, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
-                        item.pack(side="left", fill="x", expand=True, padx=4)
-                        ctk.CTkLabel(item, text=f"{icono} {titulo}:", font=("Calibri", 13, "bold"), text_color=("#6B7280", "#9CA3AF")).pack(anchor="w", padx=10, pady=(6,0))
-                        ctk.CTkLabel(item, text=str(valor), font=("Calibri", 15, "bold"), text_color=("#111827", "#F9FAFB")).pack(anchor="w", padx=10, pady=(0,6))
-
-                    crear_item_badge(f1, "🚗", "Placa", v['placa'])
-                    crear_item_badge(f1, "🚘", "Marca", v['marca'])
-                    crear_item_badge(f1, "🎨", "Color", color_txt)
-                    crear_item_badge(f1, "📅", "Modelo / Año", mod_txt)
-
-                    f2 = ctk.CTkFrame(info_box, fg_color="transparent")
-                    f2.pack(fill="x", pady=4, padx=10)
-
-                    crear_item_badge(f2, "👤", "Cliente Propietario", prop)
-                    crear_item_badge(f2, "📱", "Teléfono Contacto", tel_prop)
-
-                    # EVALUACIÓN DE ROL EXACTO (INDEPENDIENTEMENTE DE TILDES Y MAYÚSCULAS)
-                    rol_norm = str(self.rol_actual).strip().lower()
-                    if rol_norm in ["mecanico", "mecánico", "administrador", "admin"]:
-                        btn_bar_h = ctk.CTkFrame(frame_historial, fg_color="transparent")
-                        btn_bar_h.pack(fill="x", pady=(15, 10))
-
-                        ctk.CTkLabel(btn_bar_h, text="📜 HISTORIAL DE TRABAJOS REGISTRADOS", font=("Calibri", 18, "bold"), text_color=("#111827", "#F9FAFB")).pack(side="left")
-                        
-                        ctk.CTkButton(
-                            btn_bar_h, text="➕ Registrar Nuevo Trabajo", height=38,
-                            fg_color="#D32F2F", hover_color="#B71C1C", font=("Calibri", 15, "bold"),
-                            command=lambda: self.abrir_formulario_mantenimiento_embebido(v['id_vehiculo'], v['placa'])
-                        ).pack(side="right")
+                with conexion_db(True) as (con, cur):
+                    sql = ("SELECT v.*, u.nombre_completo AS propietario, u.telefono AS tel_propietario "
+                           "FROM vehiculos v LEFT JOIN usuarios u ON v.id_cliente = u.id_usuario WHERE v.placa = %s")
+                    if rol == "cliente":
+                        cur.execute(sql + " AND v.id_cliente = %s", (placa, self.id_usuario_actual))
                     else:
-                        ctk.CTkLabel(frame_historial, text="📜 HISTORIAL DE TRABAJOS REGISTRADOS", font=("Calibri", 18, "bold"), text_color=("#111827", "#F9FAFB")).pack(anchor="w", pady=(15, 10))
+                        cur.execute(sql, (placa,))
+                    v = cur.fetchone()
 
-                    cursor.execute("""
-                        SELECT m.*, u.nombre_completo AS mecanico 
-                        FROM mantenimientos m 
-                        LEFT JOIN usuarios u ON m.id_mecanico = u.id_usuario 
-                        WHERE m.id_vehiculo = %s 
-                        ORDER BY COALESCE(m.fecha_mantenimiento, m.fecha_registro) DESC
-                    """, (v['id_vehiculo'],))
-                    mantenimientos = cursor.fetchall()
-
-                    if not mantenimientos:
-                        ctk.CTkLabel(frame_historial, text="No se han registrado trabajos o mantenimientos previos para este vehículo.", font=("Calibri", 15), text_color=("#6B7280", "#9CA3AF")).pack(anchor="w", pady=10)
-                    else:
-                        tabla_card = ctk.CTkFrame(frame_historial, fg_color=("#FFFFFF", "#18181C"), corner_radius=12, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
-                        tabla_card.pack(fill="x", pady=5)
-
-                        header_table = ctk.CTkFrame(tabla_card, fg_color=("#F3F4F6", "#25252A"), corner_radius=8)
-                        header_table.pack(fill="x", padx=6, pady=6)
-
-                        cols = [("📅 FECHA", 0.15), ("🛠️ MECÁNICO", 0.20), ("📝 DESCRIPCIÓN DEL TRABAJO", 0.35), ("🔍 OBSERVACIONES", 0.18), ("💰 COSTO", 0.12)]
-                        for col_name, weight in cols:
-                            lbl_col = ctk.CTkLabel(header_table, text=col_name, font=("Calibri", 13, "bold"), text_color=("#374151", "#E5E7EB"), anchor="w")
-                            lbl_col.pack(side="left", fill="x", expand=True, padx=8, pady=8)
-
-                        for i, m in enumerate(mantenimientos):
-                            bg_row = ("#FFFFFF", "#1E1E22") if i % 2 == 0 else ("#F9FAFB", "#16161A")
-                            row_frame = ctk.CTkFrame(tabla_card, fg_color=bg_row)
-                            row_frame.pack(fill="x", padx=6, pady=2)
-
-                            fecha_maint = m['fecha_mantenimiento'] if m['fecha_mantenimiento'] else str(m['fecha_registro']).split()[0]
-                            mec_txt = m['mecanico'] if m['mecanico'] else "Taller General"
-                            obs_txt = m['observaciones'] if m['observaciones'] else "Sin observaciones"
-                            costo_txt = f"${float(m['costo']):,.0f} COP" if m['costo'] and float(m['costo']) > 0 else "N/A"
-
-                            datos_fila = [
-                                (str(fecha_maint), ("#111827", "#F9FAFB")),
-                                (mec_txt, ("#D32F2F", "#FF5252")),
-                                (m['descripcion_trabajo'], ("#111827", "#E5E7EB")),
-                                (obs_txt, ("#6B7280", "#9CA3AF")),
-                                (costo_txt, ("#2E7D32", "#81C784"))
-                            ]
-
-                            for txt_val, color_val in datos_fila:
-                                lbl_val = ctk.CTkLabel(row_frame, text=txt_val, font=("Calibri", 13), text_color=color_val, anchor="w", justify="left", wraplength=180)
-                                lbl_val.pack(side="left", fill="x", expand=True, padx=8, pady=8)
-
-                else:
-                    err_box = ctk.CTkFrame(res_container, fg_color=("#FEF2F2", "#2B1718"), corner_radius=10, border_width=1, border_color="#FCA5A5")
-                    err_box.pack(fill="x", ipadx=10, ipady=10)
-                    ctk.CTkLabel(err_box, text=f"❌ No se encontró ningún vehículo registrado con la placa '{placa}'.", font=("Calibri", 15, "bold"), text_color="#D32F2F").pack(anchor="w", padx=15)
-
-                cursor.close()
-                conexion.close()
-                self.registrar_log(f"Consultó en BD el vehículo placa {placa}")
-
+                    mantenimientos = []
+                    if v:
+                        cur.execute(
+                            "SELECT m.*, u.nombre_completo AS mecanico FROM mantenimientos m "
+                            "LEFT JOIN usuarios u ON m.id_mecanico = u.id_usuario WHERE m.id_vehiculo = %s "
+                            "ORDER BY COALESCE(m.fecha_mantenimiento, m.fecha_registro) DESC", (v['id_vehiculo'],))
+                        mantenimientos = cur.fetchall()
             except mysql.connector.Error as err:
-                messagebox.showerror("Error BD ❌", f"Error consultando BD:\n{err}")
+                messagebox.showerror("Error ❌", f"Error de consulta:\n{err}")
+                return
 
-        ctk.CTkButton(f_inner, text="🔍 Buscar en Base de Datos", height=46, fg_color="#D32F2F", hover_color="#B71C1C", font=("Calibri", 16, "bold"), command=consultar_bd).pack(fill="x")
+            self.registrar_log(f"Consultó el vehículo placa {placa}")
 
+            if not v:
+                err_box = ctk.CTkFrame(res_container, fg_color=("#FEF2F2", "#2B1718"), corner_radius=10, border_width=1, border_color="#FCA5A5")
+                err_box.pack(fill="x", ipadx=10, ipady=10)
+                ctk.CTkLabel(err_box, text=f"❌ No se encontró ningún vehículo registrado con la placa '{placa}'.",
+                             font=("Calibri", 15, "bold"), text_color=ROJO).pack(anchor="w", padx=15)
+                return
+
+            info_box = ctk.CTkFrame(res_container, fg_color=("#F3F4F6", "#141418"), corner_radius=12, border_width=1, border_color=CARD_BORDE)
+            info_box.pack(fill="x", ipadx=10, ipady=10)
+
+            def badge(parent, icono, titulo, valor):
+                item = ctk.CTkFrame(parent, fg_color=CARD_BG, corner_radius=8, border_width=1, border_color=CARD_BORDE)
+                item.pack(side="left", fill="x", expand=True, padx=4)
+                ctk.CTkLabel(item, text=f"{icono} {titulo}:", font=("Calibri", 13, "bold"), text_color=("#6B7280", "#9CA3AF")).pack(anchor="w", padx=10, pady=(6, 0))
+                ctk.CTkLabel(item, text=str(valor), font=("Calibri", 15, "bold"), text_color=TXT_T).pack(anchor="w", padx=10, pady=(0, 6))
+
+            f1 = ctk.CTkFrame(info_box, fg_color="transparent")
+            f1.pack(fill="x", pady=4, padx=10)
+            badge(f1, "🚗", "Placa", v['placa'])
+            badge(f1, "🚘", "Marca", v['marca'])
+            badge(f1, "🎨", "Color", v['color'] or "N/A")
+            badge(f1, "📅", "Modelo / Año", v['modelo'] or "N/A")
+            f2 = ctk.CTkFrame(info_box, fg_color="transparent")
+            f2.pack(fill="x", pady=4, padx=10)
+            badge(f2, "👤", "Cliente Propietario", v['propietario'] or "Sin asignación directa")
+            badge(f2, "📱", "Teléfono Contacto", v['tel_propietario'] or "N/A")
+
+            titulo_hist = "📜 HISTORIAL DE TRABAJOS REGISTRADOS"
+            if rol in ("mecanico", "administrador"):
+                barra = ctk.CTkFrame(frame_historial, fg_color="transparent")
+                barra.pack(fill="x", pady=(15, 10))
+                ctk.CTkLabel(barra, text=titulo_hist, font=("Calibri", 18, "bold"), text_color=TXT_T).pack(side="left")
+                ctk.CTkButton(barra, text="➕ Registrar Nuevo Trabajo", height=38, fg_color=ROJO, hover_color=ROJO_H, font=("Calibri", 15, "bold"),
+                              command=lambda: self.abrir_formulario_mantenimiento_embebido(v['id_vehiculo'], v['placa'])).pack(side="right")
+            else:
+                ctk.CTkLabel(frame_historial, text=titulo_hist, font=("Calibri", 18, "bold"), text_color=TXT_T).pack(anchor="w", pady=(15, 10))
+
+            if not mantenimientos:
+                ctk.CTkLabel(frame_historial, text="No se han registrado trabajos o mantenimientos previos para este vehículo.",
+                             font=("Calibri", 15), text_color=("#6B7280", "#9CA3AF")).pack(anchor="w", pady=10)
+                return
+
+            tabla = ctk.CTkFrame(frame_historial, fg_color=("#FFFFFF", "#18181C"), corner_radius=12, border_width=1, border_color=CARD_BORDE)
+            tabla.pack(fill="x", pady=5)
+            header = ctk.CTkFrame(tabla, fg_color=("#F3F4F6", "#25252A"), corner_radius=8)
+            header.pack(fill="x", padx=6, pady=6)
+            for col in ["📅 FECHA", "🛠️ MECÁNICO", "📝 DESCRIPCIÓN DEL TRABAJO", "🔍 OBSERVACIONES", "💰 COSTO"]:
+                ctk.CTkLabel(header, text=col, font=("Calibri", 13, "bold"), text_color=("#374151", "#E5E7EB"), anchor="w").pack(side="left", fill="x", expand=True, padx=8, pady=8)
+
+            for i, m in enumerate(mantenimientos):
+                row = ctk.CTkFrame(tabla, fg_color=("#FFFFFF", "#1E1E22") if i % 2 == 0 else ("#F9FAFB", "#16161A"))
+                row.pack(fill="x", padx=6, pady=2)
+                fecha = m['fecha_mantenimiento'] if m['fecha_mantenimiento'] else str(m['fecha_registro']).split()[0]
+                costo = f"${float(m['costo']):,.0f} COP" if m['costo'] and float(m['costo']) > 0 else "N/A"
+                datos = [
+                    (str(fecha), ("#111827", "#F9FAFB")),
+                    (m['mecanico'] or "Taller General", ("#D32F2F", "#FF5252")),
+                    (m['descripcion_trabajo'], ("#111827", "#E5E7EB")),
+                    (m['observaciones'] or "Sin observaciones", ("#6B7280", "#9CA3AF")),
+                    (costo, ("#2E7D32", "#81C784")),
+                ]
+                for txt, color in datos:
+                    ctk.CTkLabel(row, text=txt, font=("Calibri", 13), text_color=color, anchor="w", justify="left", wraplength=180).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+
+        ctk.CTkButton(f_inner, text="🔍 Buscar Vehículo", height=46, fg_color=ROJO, hover_color=ROJO_H, font=("Calibri", 16, "bold"), command=consultar_bd).pack(fill="x")
+        txt_p.bind("<Return>", lambda e: consultar_bd())
         if placa_predeterminada:
             consultar_bd()
 
+    # =========================================================================
+    # CIERRE DE CAJA Y CITAS
+    # =========================================================================
     def abrir_cierre_caja(self):
-        self.seleccionar_opcion_menu("caja")
-        if not hasattr(self, 'body_scroll') or not self.body_scroll:
+        if not self.tiene_rol("mecanico"):
             return
+        total, n, aviso = 0.0, 0, ""
+        try:
+            with conexion_db(True) as (con, cur):
+                cur.execute(
+                    "SELECT COALESCE(SUM(costo), 0) AS total, COUNT(*) AS n FROM mantenimientos "
+                    "WHERE DATE(fecha_mantenimiento) = CURDATE() AND id_mecanico = %s", (self.id_usuario_actual,))
+                r = cur.fetchone()
+                total, n = float(r['total']), int(r['n'])
+        except mysql.connector.Error:
+            aviso = "No se pudieron leer los totales del día."
 
-        for widget in self.body_scroll.winfo_children():
-            widget.destroy()
-
-        ctk.CTkLabel(self.body_scroll, text="💵 CIERRE DE CAJA DIARIO", font=("Calibri", 26, "bold"), text_color=("#111827", "#F9FAFB")).pack(pady=(15, 2))
-        ctk.CTkLabel(self.body_scroll, text="Resumen y balance final de recaudaciones por mano de obra y servicios", font=("Calibri", 16), text_color=("#4B5563", "#9CA3AF")).pack(pady=(0, 20))
-
-        card = ctk.CTkFrame(self.body_scroll, fg_color=("#FFFFFF", "#1E1E22"), corner_radius=16, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
-        card.pack(padx=40, pady=10, fill="x")
-
-        f_inner = ctk.CTkFrame(card, fg_color="transparent")
-        f_inner.pack(padx=30, pady=25, fill="x")
-
-        ctk.CTkLabel(f_inner, text="💰 Total Efectivo Cobrado Hoy:", font=("Calibri", 18, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        ctk.CTkLabel(f_inner, text="$ 0 COP", font=("Calibri", 36, "bold"), text_color="#2E7D32").pack(anchor="w", pady=(2, 15))
-
-        ctk.CTkLabel(f_inner, text="🚗 Trabajos Entregados y Cobrados: 0", font=("Calibri", 16, "bold"), text_color=("#374151", "#DDD")).pack(anchor="w", pady=4)
-        ctk.CTkLabel(f_inner, text="📋 Reparaciones Pendientes por Cobrar: 0", font=("Calibri", 16, "bold"), text_color=("#374151", "#DDD")).pack(anchor="w", pady=(4, 25))
+        win, cuerpo = self.crear_ventana_flotante("💵 Cierre de Caja Diario", 480, 460)
+        ctk.CTkLabel(cuerpo, text="💰 Total cobrado hoy (sus trabajos):", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
+        ctk.CTkLabel(cuerpo, text=f"$ {total:,.0f} COP", font=("Calibri", 34, "bold"), text_color="#2E7D32").pack(anchor="w", pady=(2, 12))
+        ctk.CTkLabel(cuerpo, text=f"🚗 Trabajos registrados hoy: {n}", font=("Calibri", 16, "bold"), text_color=("#374151", "#DDD")).pack(anchor="w", pady=4)
+        ctk.CTkLabel(cuerpo, text=f"📅 Fecha: {datetime.now().strftime('%d/%m/%Y')}", font=("Calibri", 15), text_color=TXT_S).pack(anchor="w", pady=4)
+        if aviso:
+            ctk.CTkLabel(cuerpo, text=aviso, font=("Calibri", 13), text_color=ROJO).pack(anchor="w", pady=4)
 
         def realizar_cierre():
-            self.registrar_log("Realizó el Cierre de Caja Diario ($0 COP)")
-            messagebox.showinfo("Cierre Guardado 💵", "El cierre de caja ha sido registrado exitosamente.")
-            self.mostrar_inicio_dashboard(self.rol_actual)
+            self.registrar_log(f"Realizó el Cierre de Caja Diario (${total:,.0f} COP, {n} trabajos)")
+            messagebox.showinfo("Cierre Guardado 💵", "El cierre de caja ha sido registrado exitosamente.", parent=win)
+            win.destroy()
 
-        ctk.CTkButton(f_inner, text="🔒 Finalizar y Cuadrar Caja", height=48, fg_color="#D32F2F", hover_color="#B71C1C", font=("Calibri", 16, "bold"), command=realizar_cierre).pack(fill="x")
+        self._barra_botones(cuerpo, "🔒 Finalizar Caja", realizar_cierre, win)
 
     def abrir_agendar_cita(self):
-        self.seleccionar_opcion_menu("citas")
-        if not hasattr(self, 'body_scroll') or not self.body_scroll:
+        if not self.tiene_rol("cliente"):
             return
+        win, cuerpo = self.crear_ventana_flotante("📅 Agendar Cita en el Taller", 480, 460)
+        txt_placa = self._campo(cuerpo, "Placa de su vehículo:", "Ej. ABC123")
+        txt_fecha = self._campo(cuerpo, "Fecha deseada:", "DD/MM/AAAA")
+        txt_motivo = self._campo(cuerpo, "Motivo de la revisión:", "Ej. Falla de frenos, ruido en motor")
 
-        for widget in self.body_scroll.winfo_children():
-            widget.destroy()
-
-        ctk.CTkLabel(self.body_scroll, text="📅 AGENDAR CITA EN EL TALLER", font=("Calibri", 26, "bold"), text_color=("#111827", "#F9FAFB")).pack(pady=(15, 2))
-        ctk.CTkLabel(self.body_scroll, text="Reserve su espacio técnico para mantenimientos y diagnósticos", font=("Calibri", 16), text_color=("#4B5563", "#9CA3AF")).pack(pady=(0, 20))
-
-        card = ctk.CTkFrame(self.body_scroll, fg_color=("#FFFFFF", "#1E1E22"), corner_radius=16, border_width=1, border_color=("#E5E7EB", "#2A2D34"))
-        card.pack(padx=40, pady=10, fill="x")
-
-        f_inner = ctk.CTkFrame(card, fg_color="transparent")
-        f_inner.pack(padx=30, pady=25, fill="x")
-
-        ctk.CTkLabel(f_inner, text="Placa de su Vehículo:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_c_placa = ctk.CTkEntry(f_inner, height=44, placeholder_text="Ej. ABC123", font=("Calibri", 16))
-        txt_c_placa.pack(fill="x", pady=(2, 12))
-
-        ctk.CTkLabel(f_inner, text="Fecha Deseada:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_c_fecha = ctk.CTkEntry(f_inner, height=44, placeholder_text="DD/MM/AAAA", font=("Calibri", 16))
-        txt_c_fecha.pack(fill="x", pady=(2, 12))
-
-        ctk.CTkLabel(f_inner, text="Motivo de la Revisión:", font=("Calibri", 16, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w")
-        txt_c_motivo = ctk.CTkEntry(f_inner, height=44, placeholder_text="Ej. Falla de frenos, ruido en motor", font=("Calibri", 16))
-        txt_c_motivo.pack(fill="x", pady=(2, 25))
-
-        def confirmar_cita():
-            p = txt_c_placa.get().strip().upper()
-            f = txt_c_fecha.get().strip()
-            if not p or not f:
-                messagebox.showwarning("Campos Incompletos ⚠️", "Por favor ingrese la placa y la fecha.")
+        def confirmar():
+            placa = txt_placa.get().strip().upper()
+            motivo = txt_motivo.get().strip()
+            if not placa or not txt_fecha.get().strip() or not motivo:
+                messagebox.showwarning("Campos Incompletos ⚠️", "Ingrese placa, fecha y motivo.", parent=win)
                 return
-            self.registrar_log(f"Solicitó cita técnica para vehículo placa {p} en la fecha {f}")
-            messagebox.showinfo("Cita Solicitada 📅", f"Su cita para la placa {p} el día {f} ha sido programada con éxito.")
-            self.mostrar_inicio_dashboard(self.rol_actual)
+            try:
+                fecha = datetime.strptime(txt_fecha.get().strip(), "%d/%m/%Y").date()
+            except ValueError:
+                messagebox.showwarning("Fecha inválida ⚠️", "Use el formato DD/MM/AAAA.", parent=win)
+                return
+            if fecha < datetime.now().date():
+                messagebox.showwarning("Fecha inválida ⚠️", "La fecha no puede ser anterior a hoy.", parent=win)
+                return
+            try:
+                with conexion_db(True) as (con, cur):
+                    cur.execute("SELECT id_vehiculo FROM vehiculos WHERE placa = %s AND id_cliente = %s", (placa, self.id_usuario_actual))
+                    if not cur.fetchone():
+                        messagebox.showerror("Vehículo no encontrado ❌", "Esa placa no está registrada a su nombre.", parent=win)
+                        return
+                    cur.execute("INSERT INTO citas (id_cliente, placa, fecha_cita, motivo) VALUES (%s, %s, %s, %s)",
+                                (self.id_usuario_actual, placa, fecha.strftime("%Y-%m-%d"), motivo))
+                    con.commit()
+                self.registrar_log(f"Solicitó cita técnica para vehículo placa {placa} en la fecha {fecha.strftime('%d/%m/%Y')}")
+                messagebox.showinfo("Cita Solicitada 📅", f"Su cita para la placa {placa} el día {fecha.strftime('%d/%m/%Y')} quedó registrada.", parent=win)
+                win.destroy()
+            except mysql.connector.Error as err:
+                messagebox.showerror("Error ❌", f"No se pudo registrar la cita:\n\n{err}", parent=win)
 
-        ctk.CTkButton(f_inner, text="📅 Confirmar Solicitud de Cita", height=48, fg_color="#D32F2F", hover_color="#B71C1C", font=("Calibri", 16, "bold"), command=confirmar_cita).pack(fill="x")
+        self._barra_botones(cuerpo, "📅 Confirmar Cita", confirmar, win)
 
     # =========================================================================
-    # PANEL PRINCIPAL Y DASHBOARD (SOLUCIÓN DASHBOARD MECÁNICO)
+    # PANEL PRINCIPAL Y DASHBOARD
     # =========================================================================
     def mostrar_inicio(self):
-        if self.frame_login:
-            self.frame_login.destroy()
-            self.frame_login = None
-        if self.frame_registro:
-            self.frame_registro.destroy()
-            self.frame_registro = None
+        for attr in ("frame_login", "frame_registro"):
+            f = getattr(self, attr)
+            if f:
+                f.destroy()
+                setattr(self, attr, None)
 
         self.btn_theme_login.place_forget()
         self.footer.place_forget()
         self.card_main.place_forget()
-        
+
         self.frame_inicio = ctk.CTkFrame(self, fg_color="transparent")
         self.frame_inicio.pack(fill="both", expand=True)
-
         self.actualizar_visibilidad_fondo()
 
-        rol_norm = str(self.rol_actual).strip().lower()
+        rol_norm = normalizar_rol(self.rol_actual)
 
-        # SIDEBAR DE NAVEGACIÓN
         self.sidebar = ctk.CTkFrame(self.frame_inicio, width=260, corner_radius=0, fg_color=("#FFFFFF", "#121215"))
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
-        if os.path.exists(self.ruta_logo):
-            img_c = self.hacer_imagen_circular(self.ruta_logo, (130, 130))
-            img_l = ctk.CTkImage(light_image=img_c, dark_image=img_c, size=(130, 130))
+        img_l = self._logo(130)
+        if img_l:
             ctk.CTkLabel(self.sidebar, image=img_l, text="").pack(pady=(20, 15))
 
         self.btn_menu_activos = {}
+        inicio = ("inicio", "🏠  Inicio", lambda: self.mostrar_inicio_dashboard(self.rol_actual))
 
-        if rol_norm in ["admin", "administrador"]:
-            menu_opciones = [
-                ("inicio", "🏠  Inicio", lambda: self.mostrar_inicio_dashboard(self.rol_actual)),
-                ("vehiculos", "🚗  Registrar Vehículo", self.abrir_registro_vehiculo),
-                ("buscar", "🔎  Buscar Vehículo", self.buscar_vehiculo_por_placa),
-                ("usuarios", "👥  Usuarios", lambda: self.mostrar_lista_usuarios("Todos", "Todos")),
-                ("logs", "📜  Auditoría", self.mostrar_historial_logs),
-            ]
-        elif rol_norm in ["mecanico", "mecánico"]:
-            menu_opciones = [
-                ("inicio", "🏠  Inicio", lambda: self.mostrar_inicio_dashboard(self.rol_actual)),
-                ("vehiculos", "🚗  Recepción Carro", self.abrir_registro_vehiculo),
-                ("buscar", "🔎  Buscar Vehículo", self.buscar_vehiculo_por_placa),
-                ("caja", "💵  Cierre Caja", self.abrir_cierre_caja),
-            ]
-        else:  # Cliente
-            menu_opciones = [
-                ("inicio", "🏠  Inicio", lambda: self.mostrar_inicio_dashboard(self.rol_actual)),
-                ("vehiculos", "🚗  Registrar Mi Vehículo", self.abrir_registro_vehiculo),
-                ("buscar", "🔎  Mi Vehículo", self.buscar_vehiculo_por_placa),
-                ("citas", "📅  Agendar Cita", self.abrir_agendar_cita),
-            ]
+        if rol_norm == "administrador":
+            menu = [inicio,
+                    ("vehiculos", "🚗  Registrar Vehículo", self.abrir_registro_vehiculo),
+                    ("buscar", "🔎  Buscar Vehículo", self.buscar_vehiculo_por_placa),
+                    ("usuarios", "👥  Usuarios", lambda: self.mostrar_lista_usuarios("Todos", "Todos")),
+                    ("logs", "📜  Auditoría", self.mostrar_historial_logs)]
+        elif rol_norm == "mecanico":
+            menu = [inicio,
+                    ("vehiculos", "🚗  Recepcion Carro", self.abrir_registro_vehiculo),
+                    ("buscar", "🔎  Buscar Vehículo", self.buscar_vehiculo_por_placa),
+                    ("caja", "💵  Cierre Caja", self.abrir_cierre_caja)]
+        else:
+            menu = [inicio,
+                    ("vehiculos", "🚗  Registrar Mi Vehículo", self.abrir_registro_vehiculo),
+                    ("buscar", "🔎  Mi Vehículo", self.buscar_vehiculo_por_placa),
+                    ("citas", "📅  Agendar Cita", self.abrir_agendar_cita)]
 
-        for clave, texto, comando in menu_opciones:
-            btn = ctk.CTkButton(
-                self.sidebar, text=texto, anchor="w", height=46, 
-                corner_radius=8, fg_color="transparent", text_color=("#222222", "#E0E0E0"), 
-                font=("Calibri", 15, "bold"), command=comando
-            )
+        for clave, texto, comando in menu:
+            btn = ctk.CTkButton(self.sidebar, text=texto, anchor="w", height=46, corner_radius=8, fg_color="transparent",
+                                text_color=("#222222", "#E0E0E0"), font=("Calibri", 15, "bold"), command=comando)
             btn.pack(fill="x", padx=12, pady=3)
             self.btn_menu_activos[clave] = btn
 
-        bottom_sidebar = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        bottom_sidebar.pack(side="bottom", fill="x", padx=12, pady=20)
+        bottom = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        bottom.pack(side="bottom", fill="x", padx=12, pady=20)
+        ctk.CTkButton(bottom, text="☀️ / 🌙", anchor="center", height=40, corner_radius=8, fg_color=("#E5E7EB", "#1E1E22"),
+                      text_color=("#111827", "#FFFFFF"), hover_color=("#D1D5DB", "#2B2B30"), font=("Segoe UI Emoji", 15, "bold"),
+                      command=self.cambiar_tema).pack(fill="x", pady=(0, 8))
+        ctk.CTkButton(bottom, text="🚪  Cerrar Sesión", anchor="w", height=44, corner_radius=8, fg_color="transparent",
+                      hover_color=("#F5F5F5", "#2B2B2B"), text_color=("#222222", "#E0E0E0"), font=("Calibri", 15, "bold"),
+                      command=self.cerrar_sesion).pack(fill="x")
 
-        btn_theme_sidebar = ctk.CTkButton(
-            bottom_sidebar, text="☀️ / 🌙 Cambiar Tema", anchor="w", height=40,
-            corner_radius=8, fg_color=("#E5E7EB", "#1E1E22"), text_color=("#111827", "#FFFFFF"),
-            hover_color=("#D1D5DB", "#2B2B30"), font=("Calibri", 14, "bold"),
-            command=self.cambiar_tema
-        )
-        btn_theme_sidebar.pack(fill="x", pady=(0, 8))
-
-        btn_salir = ctk.CTkButton(
-            bottom_sidebar, text="🚪  Cerrar Sesión", anchor="w", height=44, 
-            corner_radius=8, fg_color="transparent", hover_color=("#F5F5F5", "#2B2B2B"), 
-            text_color=("#222222", "#E0E0E0"), font=("Calibri", 15, "bold"), 
-            command=self.cerrar_sesion
-        )
-        btn_salir.pack(fill="x")
-
-        # ÁREA PRINCIPAL
         main_content = ctk.CTkFrame(self.frame_inicio, fg_color="transparent")
         main_content.pack(side="right", fill="both", expand=True, padx=25, pady=20)
 
         top_bar = ctk.CTkFrame(main_content, fg_color="transparent")
         top_bar.pack(fill="x", pady=(0, 15))
-
         user_header = ctk.CTkFrame(top_bar, fg_color="transparent")
         user_header.pack(side="left")
-        
-        ctk.CTkLabel(user_header, text="👤", font=("Segoe UI Emoji", 24), text_color="#D32F2F").pack(side="left", padx=(0, 10))
-        
-        info_header = ctk.CTkFrame(user_header, fg_color="transparent")
-        info_header.pack(side="left")
-        ctk.CTkLabel(info_header, text=f"¡Bienvenido, {self.usuario_actual}!", font=("Calibri", 22, "bold"), text_color=("#111827", "#FFFFFF")).pack(anchor="w")
-        ctk.CTkLabel(info_header, text=f"Panel ejecutivo - Rol: {str(self.rol_actual).strip().capitalize()}", font=("Calibri", 14), text_color=("#6B7280", "#AAAAAA")).pack(anchor="w")
+        ctk.CTkLabel(user_header, text="👤", font=("Segoe UI Emoji", 24), text_color=ROJO).pack(side="left", padx=(0, 10))
+        info = ctk.CTkFrame(user_header, fg_color="transparent")
+        info.pack(side="left")
+        ctk.CTkLabel(info, text=f"¡Bienvenido, {self.usuario_actual}!", font=("Calibri", 22, "bold"), text_color=("#111827", "#FFFFFF")).pack(anchor="w")
+        ctk.CTkLabel(info, text=f"Panel ejecutivo - Rol: {str(self.rol_actual).strip().capitalize()}", font=("Calibri", 14),
+                     text_color=("#6B7280", "#AAAAAA")).pack(anchor="w")
 
         self.body_scroll = ctk.CTkScrollableFrame(main_content, fg_color="transparent")
         self.body_scroll.pack(fill="both", expand=True)
-
         self.mostrar_inicio_dashboard(self.rol_actual)
 
     def mostrar_inicio_dashboard(self, rol_param):
+        if not self.body_scroll:
+            return
         self.seleccionar_opcion_menu("inicio")
+        for w in self.body_scroll.winfo_children():
+            w.destroy()
 
-        for widget in self.body_scroll.winfo_children():
-            widget.destroy()
-
-        rol_norm = str(rol_param).strip().lower()
-
-        # CONTEOS BD EN TIEMPO REAL
-        num_usuarios = self.obtener_conteo_real("SELECT COUNT(*) FROM usuarios")
-        num_mecanicos = self.obtener_conteo_real("SELECT COUNT(*) FROM usuarios WHERE LOWER(rol) LIKE '%mecanico%' OR LOWER(rol) LIKE '%mecánico%'")
-        num_admins = self.obtener_conteo_real("SELECT COUNT(*) FROM usuarios WHERE LOWER(rol) LIKE '%admin%'")
-        num_clientes = self.obtener_conteo_real("SELECT COUNT(*) FROM usuarios WHERE LOWER(rol) LIKE '%cliente%'")
-        num_logs = self.obtener_conteo_real("SELECT COUNT(*) FROM logs_sistema")
-        num_vehiculos = self.obtener_conteo_real("SELECT COUNT(*) FROM vehiculos")
-
-        grid_frame = ctk.CTkFrame(self.body_scroll, fg_color="transparent")
-        grid_frame.pack(fill="x", pady=(10, 20))
-
-        def vincular_evento_clic(widget, funcion):
-            widget.bind("<Button-1>", lambda e: funcion())
-            for hijo in widget.winfo_children():
-                vincular_evento_clic(hijo, funcion)
-
-        def crear_tarjeta_unificada(parent, icono, titulo, cifra, descripcion, comando):
-            card = ctk.CTkFrame(
-                parent, fg_color=("#FFFFFF", "#18181C"), corner_radius=16, 
-                border_width=1, border_color=("#E5E7EB", "#2D2D35"), height=200
-            )
-            card.pack(side="left", fill="both", expand=True, padx=8)
-            card.pack_propagate(False)
-
-            top_f = ctk.CTkFrame(card, fg_color="transparent")
-            top_f.pack(fill="x", padx=16, pady=(16, 4))
-
-            icon_box = ctk.CTkFrame(top_f, width=46, height=46, corner_radius=23, fg_color=("#FFF0F0", "#341719"))
-            icon_box.pack(side="left")
-            icon_box.pack_propagate(False)
-            ctk.CTkLabel(icon_box, text=icono, font=("Segoe UI Emoji", 20), text_color="#D32F2F").place(relx=0.5, rely=0.5, anchor="center")
-
-            ctk.CTkLabel(top_f, text=str(cifra), font=("Calibri", 26, "bold"), text_color=("#111827", "#FFFFFF")).pack(side="right")
-
-            ctk.CTkLabel(card, text=titulo, font=("Calibri", 18, "bold"), text_color=("#111827", "#FFFFFF")).pack(pady=(4, 2))
-            ctk.CTkLabel(card, text=descripcion, font=("Calibri", 13), text_color=("#6B7280", "#999999"), wraplength=180, justify="center").pack(pady=(0, 10))
-
-            btn_arrow = ctk.CTkFrame(card, width=34, height=34, corner_radius=17, fg_color="#D32F2F")
-            btn_arrow.place(relx=0.88, rely=0.84, anchor="center")
-            btn_arrow.pack_propagate(False)
-            ctk.CTkLabel(btn_arrow, text="➔", font=("Calibri", 15, "bold"), text_color="#FFFFFF").place(relx=0.5, rely=0.5, anchor="center")
-
-            vincular_evento_clic(card, comando)
-
-        if rol_norm in ["admin", "administrador"]:
-            crear_tarjeta_unificada(grid_frame, "🚗", "Registrar Vehículo", num_vehiculos, "Gestión e ingreso de autos al taller.", self.abrir_registro_vehiculo)
-            crear_tarjeta_unificada(grid_frame, "🔎", "Buscar Vehículo", num_vehiculos, "Consulte el historial de un auto por placa.", self.buscar_vehiculo_por_placa)
-            crear_tarjeta_unificada(grid_frame, "👥", "Usuarios", num_usuarios, "Control de cuentas y asignación de roles.", lambda: self.mostrar_lista_usuarios("Todos", "Todos"))
-            crear_tarjeta_unificada(grid_frame, "📜", "Auditoría", num_logs, "Historial de logs y acciones del sistema.", self.mostrar_historial_logs)
-
-        elif rol_norm in ["mecanico", "mecánico"]:
-            crear_tarjeta_unificada(grid_frame, "🚗", "Recepción Carro", num_vehiculos, "Ingresar auto y registrar datos técnicos.", self.abrir_registro_vehiculo)
-            crear_tarjeta_unificada(grid_frame, "🔎", "Buscar Vehículo", num_vehiculos, "Consultar detalles de vehículos por placa.", self.buscar_vehiculo_por_placa)
-            crear_tarjeta_unificada(grid_frame, "💵", "Cierre de Caja", "$ 0 COP", "Registrar balance diario y cobros.", self.abrir_cierre_caja)
-
-        else:  # Cliente
-            crear_tarjeta_unificada(grid_frame, "🚗", "Registrar Mi Vehículo", num_vehiculos, "Inscribe tu automóvil en nuestra plataforma.", self.abrir_registro_vehiculo)
-            crear_tarjeta_unificada(grid_frame, "🔎", "Mi Vehículo", num_vehiculos, "Consultar el estado técnico de su auto.", self.buscar_vehiculo_por_placa)
-            crear_tarjeta_unificada(grid_frame, "📅", "Agendar Cita", "0", "Solicitar cita de revisión técnica.", self.abrir_agendar_cita)
-
-        if rol_norm in ["admin", "administrador"]:
-            chart_card = ctk.CTkFrame(self.body_scroll, fg_color=("#FFFFFF", "#18181C"), corner_radius=16, border_width=1, border_color=("#E5E7EB", "#2D2D35"), height=300)
-            chart_card.pack(fill="x", pady=10, padx=8)
-            chart_card.pack_propagate(False)
-
-            ctk.CTkLabel(chart_card, text="📊 Resumen Estadístico de Cuentas del Sistema", font=("Calibri", 18, "bold"), text_color=("#111827", "#FFF")).pack(anchor="w", padx=20, pady=(15, 5))
-
-            bg_canvas = "#FFFFFF" if ctk.get_appearance_mode() == "Light" else "#18181C"
-            canvas = Canvas(chart_card, bg=bg_canvas, highlightthickness=0, height=220)
-            canvas.pack(fill="both", expand=True, padx=20, pady=(0, 10))
-
-            def dibujar_grafico_grande():
-                canvas.update()
-                w_width = canvas.winfo_width()
-                if w_width < 100:
-                    w_width = 800
-
-                roles = [("Administradores", num_admins, "#D32F2F"), ("Mecánicos", num_mecanicos, "#FF5252"), ("Clientes", num_clientes, "#E57373")]
-                max_val = max([v for _, v, _ in roles] + [1])
-                
-                ancho_bar = 100
-                gap = 120
-                max_h = 130
-                
-                total_w = (len(roles) * ancho_bar) + ((len(roles) - 1) * gap)
-                start_x = (w_width - total_w) / 2
-
-                canvas.create_line(start_x - 30, 170, start_x + total_w + 30, 170, fill="#E5E7EB" if ctk.get_appearance_mode()=="Light" else "#555555", width=2)
-
-                for i, (nombre, val, color) in enumerate(roles):
-                    h = int((val / max_val) * max_h) if max_val > 0 else 8
-                    if h < 8: h = 8
-                    
-                    x0 = start_x + i * (ancho_bar + gap)
-                    y0 = 170 - h
-                    x1 = x0 + ancho_bar
-                    y1 = 170
-
-                    canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
-                    txt_color = "#111827" if ctk.get_appearance_mode() == "Light" else "#FFFFFF"
-                    canvas.create_text(x0 + ancho_bar/2, y0 - 14, text=str(val), fill=txt_color, font=("Calibri", 15, "bold"))
-                    canvas.create_text(x0 + ancho_bar/2, 190, text=nombre, fill=txt_color, font=("Calibri", 13, "bold"))
-
-            self.after(150, dibujar_grafico_grande)
+        rol_norm = normalizar_rol(self.rol_actual)
+        if rol_norm == "administrador":
+            vista = VistaAdministrador(self.body_scroll, self)
+        elif rol_norm == "mecanico":
+            vista = VistaMecanico(self.body_scroll, self)
+        else:
+            vista = VistaCliente(self.body_scroll, self)
+        vista.pack(fill="both", expand=True)
 
     # =========================================================================
-    # VALIDACIÓN DE LOGIN Y CIERRE DE SESIÓN
+    # CIERRE DE SESIÓN
     # =========================================================================
-    def validar_login(self):
-        usr = self.txt_user_login.get().strip()
-        pas = self.txt_pass_login.get().strip()
+    def cerrar_sesion_forzado(self):
+        """Limpia la vista y regresa a la pantalla de Inicio de Sesión (Login)."""
+        self.cerrar_modal_desbloqueo()
+        self.cerrar_ventanas_flotantes()
 
-        if not usr or not pas:
-            messagebox.showwarning("Datos Incompletos ⚠️", "Ingrese usuario y contraseña.")
-            return
+        if self.frame_inicio:
+            self.frame_inicio.destroy()
+        self.frame_inicio = None
+        self.body_scroll = None
+        self.btn_menu_activos = {}
 
-        pass_hash = hashlib.sha256(pas.encode()).hexdigest()
+        self.usuario_actual = ""
+        self.rol_actual = ""
+        self.id_usuario_actual = None
+        self.token_sesion_actual = None
+        self.bloqueo_pantalla_activo = False
 
-        try:
-            conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-            cursor = conexion.cursor(dictionary=True)
-            cursor.execute("SELECT id_usuario, nombre_completo, rol, password_hash, estado FROM usuarios WHERE usuario = %s", (usr,))
-            user = cursor.fetchone()
-
-            if not user:
-                messagebox.showerror("Usuario No Registrado ❌", f"El usuario '{usr}' no existe.")
-            elif user['estado'] != 'Activo':
-                messagebox.showwarning("Cuenta Inactiva ⚠️", "Esta cuenta ha sido desactivada por la administración.")
-            elif user['password_hash'] != pass_hash:
-                messagebox.showerror("Contraseña Incorrecta ❌", "La contraseña es incorrecta.")
-            else:
-                self.usuario_actual = user['nombre_completo']
-                self.rol_actual = user['rol']
-                self.id_usuario_actual = user['id_usuario']
-                cursor.close()
-                conexion.close()
-
-                # INICIA SIEMPRE EN MODO CLARO ("Light")
-                ctk.set_appearance_mode("Light")
-
-                self.registrar_log("Inicio de sesión exitoso")
-                self.mostrar_inicio()
-                return
-
-            cursor.close()
-            conexion.close()
-        except mysql.connector.Error as err:
-            messagebox.showerror("Error BD ❌", f"No se pudo conectar a MySQL:\n{err}")
-
-    def guardar_registro(self):
-        nombre = self.reg_nombre.get().strip()
-        usuario = self.reg_usuario.get().strip()
-        correo = self.reg_correo.get().strip()
-        telefono = self.reg_telefono.get().strip()
-        pass1 = self.reg_pass1.get().strip()
-        pass2 = self.reg_pass2.get().strip()
-
-        errores = []
-        if not nombre or not usuario or not correo or not telefono or not pass1 or not pass2:
-            errores.append("• Todos los campos son obligatorios.")
-        if pass1 and pass2 and pass1 != pass2:
-            errores.append("• Las contraseñas no coinciden.")
-
-        if errores:
-            messagebox.showerror("Errores de Validación ❌", "\n".join(errores))
-            return
-
-        pass_hash = hashlib.sha256(pass1.encode()).hexdigest()
-
-        try:
-            conexion = mysql.connector.connect(host="localhost", user="root", password="", database="taller_automotriz_db", port=3306)
-            cursor = conexion.cursor()
-            sql = "INSERT INTO usuarios (nombre_completo, usuario, correo, telefono, password_hash, rol, estado) VALUES (%s, %s, %s, %s, %s, 'Cliente', 'Activo')"
-            cursor.execute(sql, (nombre, usuario, correo, telefono, pass_hash))
-            conexion.commit()
-
-            cursor.close()
-            conexion.close()
-
-            self.usuario_actual = nombre
-            self.rol_actual = "Cliente"
-            self.registrar_log("Nuevo cliente registrado desde la plataforma pública")
-
-            messagebox.showinfo("Registro Exitoso 🎉", f"¡Cuenta creada correctamente!\nInicie sesión con el usuario: {usuario}")
-            self.mostrar_login()
-
-        except mysql.connector.Error as err:
-            messagebox.showerror("Error BD ❌", f"Error:\n{err}")
+        self.mostrar_login()
 
     def cerrar_sesion(self):
         if messagebox.askyesno("Cerrar Sesión 🚪", "¿Desea cerrar la sesión actual?"):
             self.registrar_log("Cerró la sesión")
-            if hasattr(self, 'sidebar'): self.sidebar.destroy()
-            self.frame_inicio.destroy()
-            self.frame_inicio = None
-            self.usuario_actual = ""
-            self.rol_actual = ""
-            self.id_usuario_actual = None
-            self.mostrar_login()
+            self.cerrar_sesion_forzado()
+
 
 if __name__ == "__main__":
     app = AppTallerAutomotriz()
